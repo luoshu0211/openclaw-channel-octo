@@ -104,6 +104,12 @@ let dispatchTimeoutTestOverrideMs: number | null = null;
 // releases the per-group queue promptly.
 const DISPATCH_TIMEOUT_APOLOGY_DEFAULT_MS = 10_000;
 let DISPATCH_TIMEOUT_APOLOGY_MS = DISPATCH_TIMEOUT_APOLOGY_DEFAULT_MS;
+// A timed-out Bot Task gets one bounded grace period to honour abortSignal.
+// Once this expires we must release the account queue, but the task becomes
+// terminal: the abandoned Agent may still commit side effects, so replaying it
+// would be unsafe.
+const DISPATCH_ABORT_GRACE_DEFAULT_MS = 10_000;
+let DISPATCH_ABORT_GRACE_MS = DISPATCH_ABORT_GRACE_DEFAULT_MS;
 
 export function _setDispatchTimeoutForTests(ms: number | null): void {
   dispatchTimeoutTestOverrideMs = ms;
@@ -145,6 +151,10 @@ export function resolveDispatchTimeoutMs(
 
 export function _setDispatchApologyTimeoutForTests(ms: number | null): void {
   DISPATCH_TIMEOUT_APOLOGY_MS = ms === null ? DISPATCH_TIMEOUT_APOLOGY_DEFAULT_MS : ms;
+}
+
+export function _setDispatchAbortGraceForTests(ms: number | null): void {
+  DISPATCH_ABORT_GRACE_MS = ms === null ? DISPATCH_ABORT_GRACE_DEFAULT_MS : ms;
 }
 
 // Pending inbound context for before_prompt_build hook injection.
@@ -1609,6 +1619,10 @@ export async function handleInboundMessage(params: {
     ) => Promise<void>;
     /** 回合末尾上报一次事实;没上报按「什么都没发生」处理(见 doc-mention-handler.ts)。 */
     reportTurn: (report: DocTaskTurnReport) => void;
+    /** 仅 Bot Task 开启，超时时中止底层 Agent。 */
+    abortOnTimeout?: boolean;
+    /** 将回合交给 Agent runtime 前调用。 */
+    onAgentTurnStarted?: () => void | Promise<void>;
   };
 }) {
   const { account, message, botUid, groupHistories, lastBotReplySeqMap, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
@@ -3321,13 +3335,13 @@ export async function handleInboundMessage(params: {
   // an upstream dispatch hang would leave the per-group queue's Promise chain
   // unresolved forever — see issue #75.
   //
-  // Scope note: we intentionally do NOT try to cancel an already-in-flight
-  // dispatch or gate late deliver/onError callbacks from a "woken up" old
-  // dispatch. Those are second-order consistency concerns, not the reported
-  // symptom (silent permanent stuck). If a hung dispatch resumes after our
-  // timeout, the worst outcome is a delayed real reply arriving after the
-  // "处理超时" apology — annoying, not broken. Adding cancel/gate semantics
-  // is tracked separately and intentionally kept out of this issue.
+  // Ordinary IM/doc-comment turns retain the historical queue-unblocking
+  // behavior. Generic Bot Tasks are different: retrying while the timed-out
+  // agent is still running can duplicate non-idempotent octo-cli writes. For
+  // abortOnTimeout turns we therefore abort the underlying agent run
+  // and wait up to a bounded grace period before releasing queueScope. The
+  // handler persists the started boundary before this runtime handoff, so any
+  // later timeout is terminal and cannot be replayed automatically.
   //
   // timeoutError: a per-invocation Error so the outer catch identifies "this
   // is OUR timeout" by reference equality, never by string comparison —
@@ -3337,15 +3351,22 @@ export async function handleInboundMessage(params: {
   const timeoutError = new Error(
     `octo: dispatch timed out after ${dispatchTimeoutMs}ms`,
   );
-  const dispatchTimeoutPromise = new Promise<never>((_, reject) => {
-    dispatchTimeoutHandle = setTimeout(() => {
-      reject(timeoutError);
-    }, dispatchTimeoutMs);
-  });
-
+  const abortTimedOutDispatch = docTask?.abortOnTimeout === true;
+  const dispatchAbortController = abortTimedOutDispatch ? new AbortController() : undefined;
+  let dispatchTimeoutPromise: Promise<never> | undefined;
+  let dispatchPromise: Promise<unknown> | undefined;
   try {
-    await Promise.race([
-      core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    // Persist the at-most-once boundary before invoking the runtime. The
+    // dispatch timeout starts afterwards so a slow state store cannot produce
+    // an unhandled timer rejection while this callback is still pending.
+    await docTask?.onAgentTurnStarted?.();
+    dispatchTimeoutPromise = new Promise<never>((_, reject) => {
+      dispatchTimeoutHandle = setTimeout(() => {
+        reject(timeoutError);
+        dispatchAbortController?.abort(timeoutError);
+      }, dispatchTimeoutMs);
+    });
+    dispatchPromise = core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
       cfg: config,
       // DM defaults to message_tool_only on some harnesses (e.g. Codex's
@@ -3366,8 +3387,16 @@ export async function handleInboundMessage(params: {
           ? {
               sourceReplyDeliveryMode: "automatic" as const,
               onReasoningStream: captureReasoning,
+              ...(dispatchAbortController
+                ? { abortSignal: dispatchAbortController.signal }
+                : {}),
             }
-          : { onReasoningStream: captureReasoning },
+          : {
+              onReasoningStream: captureReasoning,
+              ...(dispatchAbortController
+                ? { abortSignal: dispatchAbortController.signal }
+                : {}),
+            },
       // onFreshSettledDelivery is not in the published dispatcher-options type,
       // hence the cast. It is the *only* flush site for pendingToolWarningFinal,
       // and the defer gate no longer piggybacks on the tool-warning classifier
@@ -3617,9 +3646,8 @@ export async function handleInboundMessage(params: {
       } as ReplyDispatcherWithTypingOptions & {
         onFreshSettledDelivery?: () => Promise<{ visibleReplySent: boolean } | undefined>;
       }),
-      }),
-      dispatchTimeoutPromise,
-    ]);
+    });
+    await Promise.race([dispatchPromise, dispatchTimeoutPromise]);
   } catch (err) {
     // Timeout: dispatch never returned within dispatchTimeoutMs. Tell the
     // user, suppress any stale buffered text (so the finally-flush branch
@@ -3627,15 +3655,38 @@ export async function handleInboundMessage(params: {
     // .catch() (channel.ts#enqueueInbound) can advance to the next message
     // — otherwise this group stays stuck forever, see issue #75.
     //
-    // We do NOT gate late deliver/onError callbacks from the still-running
-    // upstream dispatch — that "ghost reply" suppression is intentionally
-    // out of scope for #75 (see scope-note comment above timeoutError).
     if (err === timeoutError) {
-      clearInterval(typingInterval);
-      dispatchFailed = true;
+      // Emit the primary diagnostic before waiting for cooperative shutdown;
+      // otherwise an abort-ignoring host makes the timeout itself invisible.
       log?.warn?.(
         `octo: dispatch hung past ${dispatchTimeoutMs}ms, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
       );
+      // Give Bot Tasks a bounded chance to honour abortSignal. If a run ignores
+      // cancellation, release the queue anyway. The handler already knows the
+      // Agent started and will dead-letter rather than replay this event.
+      if (abortTimedOutDispatch && dispatchPromise) {
+        let abortGraceHandle: ReturnType<typeof setTimeout> | undefined;
+        const abortOutcome = await Promise.race([
+          dispatchPromise.then(
+            () => "fulfilled" as const,
+            () => "rejected" as const,
+          ),
+          new Promise<"abandoned">((resolve) => {
+            abortGraceHandle = setTimeout(() => resolve("abandoned"), DISPATCH_ABORT_GRACE_MS);
+          }),
+        ]);
+        if (abortGraceHandle) clearTimeout(abortGraceHandle);
+        if (abortOutcome === "abandoned") {
+          // Observe a possible late rejection after we deliberately stop
+          // awaiting this promise.
+          void dispatchPromise.catch(() => undefined);
+          log?.error?.(
+            `octo: timed-out bot task dispatch ignored abort for ${DISPATCH_ABORT_GRACE_MS}ms; releasing queue and forbidding retry (session=${route?.sessionKey ?? "?"})`,
+          );
+        }
+      }
+      clearInterval(typingInterval);
+      dispatchFailed = true;
       deliverBuffer.lastText = null;
       deliverBuffer.textSent = true;
       // 和下面 dispatch-rejected 分支同一条守卫(见其注释):答复已经发出去了就别再
@@ -3647,6 +3698,12 @@ export async function handleInboundMessage(params: {
       // 在 docTasks 关着时也走,是普通 DM/群聊上的静默回归。
       if (userFacingFinalDelivered) {
         log?.info?.("octo: dispatch timed out after a final answer already landed — suppressing the timeout notice");
+      } else if (abortTimedOutDispatch) {
+        // Generic Bot Tasks have no channel destination: their business reply
+        // (when required) goes through the source-specific CLI. Keep this
+        // synthetic timeout notice as operator telemetry instead of trying to
+        // post it to an invented destination.
+        log?.info?.("octo: bot task timeout notice suppressed; handler will dead-letter without replay");
       } else {
         try {
           // The apology call itself MUST be bounded — otherwise a sick Octo API

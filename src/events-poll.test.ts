@@ -10,6 +10,7 @@ import {
   type EventCursorStore,
 } from "./events-poll.js";
 import type { CardAction } from "./card-action.js";
+import { RetryableBotTaskError } from "./bot-task-handler.js";
 import {
   _resetBotCardProfileCacheForTests,
   getBotCardProfile,
@@ -26,6 +27,21 @@ const actionEvent = (eventId: number) => ({
     action_id: "approve",
     operator_uid: "u1",
     inputs: {},
+  },
+});
+
+const botTaskEvent = (eventId: number) => ({
+  event_id: eventId,
+  event_type: "bot_task",
+  event_data: {
+    source: "loop",
+    task_type: "loop_issue_comment_mention",
+    idempotency_key: `task-${eventId}`,
+    bot_uid: "bot-1",
+    actor_uid: "user-1",
+    session_key: "issue-1",
+    prompt: "reply using octo-cli",
+    context: { issue_id: "issue-1" },
   },
 });
 
@@ -84,7 +100,7 @@ describe("event poller", () => {
         "https://api.test/v1/bot/events/12/ack",
       ]);
     expect(poller.cursor()).toBe(12);
-    expect(info).toContain("octo: event poll batch events=2 card_actions=2 doc_mentions=0 cursor=12");
+    expect(info).toContain("octo: event poll batch events=2 card_actions=2 doc_mentions=0 bot_tasks=0 cursor=12");
     poller.stop();
   });
 
@@ -112,6 +128,168 @@ describe("event poller", () => {
     expect(cursor.saved).toEqual([]);
     expect(acked).toEqual([]);
     expect(poller.cursor()).toBe(20);
+    poller.stop();
+  });
+
+  it("bot_task 成功后保存并 ACK，运行时失败时保留给下一轮重试", async () => {
+    const acked: string[] = [];
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (String(url).endsWith("/ack")) {
+        acked.push(String(url));
+        return new Response("");
+      }
+      return Response.json({ results: [botTaskEvent(25)] });
+    }) as typeof fetch;
+    const cursor = memoryCursor(24);
+    const handler = vi.fn()
+      .mockRejectedValueOnce(new Error("runtime down"))
+      .mockResolvedValueOnce(undefined);
+    const poller = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 1000,
+      cursorStore: cursor,
+      onBotTask: handler,
+    });
+
+    await poller.ready;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(cursor.saved).toEqual([]);
+    expect(acked).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(cursor.saved).toEqual([25]);
+    expect(acked).toEqual(["https://api.test/v1/bot/events/25/ack"]);
+    poller.stop();
+  });
+
+  it("bot_task 重试不阻断同批后续事件，且 cursor 不越过失败缺口", async () => {
+    const acked: string[] = [];
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (String(url).endsWith("/ack")) {
+        acked.push(String(url));
+        return new Response("");
+      }
+      return Response.json({ results: [botTaskEvent(50), actionEvent(51)] });
+    }) as typeof fetch;
+    const cursor = memoryCursor(49);
+    const onCardAction = vi.fn();
+    const poller = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 1000,
+      cursorStore: cursor,
+      onBotTask: vi.fn().mockRejectedValue(new Error("retry task")),
+      onCardAction,
+    });
+
+    await poller.ready;
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(onCardAction).toHaveBeenCalledOnce();
+    expect(cursor.saved).toEqual([]);
+    expect(poller.cursor()).toBe(49);
+    expect(acked).toEqual(["https://api.test/v1/bot/events/51/ack"]);
+    poller.stop();
+  });
+
+  it("paces a long-poll bot_task retry from the persisted attempt instead of hot-looping", async () => {
+    global.fetch = vi.fn().mockResolvedValue(
+      Response.json({ results: [botTaskEvent(50)] }),
+    ) as typeof fetch;
+    const poller = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 1000,
+      waitSeconds: 5,
+      cursorStore: memoryCursor(49),
+      onBotTask: vi.fn().mockRejectedValue(
+        new RetryableBotTaskError(new Error("runtime down"), 2),
+      ),
+    });
+
+    await poller.ready;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+    poller.stop();
+  });
+
+  it("invalid bot_task logs the rejected field and acknowledges without claiming a dead letter", async () => {
+    const errors: string[] = [];
+    const acked: string[] = [];
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (String(url).endsWith("/ack")) {
+        acked.push(String(url));
+        return new Response("");
+      }
+      return Response.json({
+        results: [{ event_id: 52, event_type: "bot_task", event_data: { prompt: "x" } }],
+      });
+    }) as typeof fetch;
+    const cursor = memoryCursor(51);
+    const poller = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 1000,
+      cursorStore: cursor,
+      onBotTask: vi.fn(),
+      log: { error: (message) => errors.push(message) },
+    });
+
+    await poller.ready;
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(errors.join("\n")).toContain("source must be a non-empty string");
+    expect(errors.join("\n")).not.toContain("dead-lettered");
+    expect(acked).toEqual(["https://api.test/v1/bot/events/52/ack"]);
+    expect(cursor.saved).toEqual([52]);
+    poller.stop();
+  });
+
+  it("ACKs a deeply nested poison bot_task and continues draining the batch", async () => {
+    const acked: string[] = [];
+    const poison = botTaskEvent(53);
+    const { context: _context, ...poisonData } = poison.event_data;
+    const deepContextJson = `${'{"nested":'.repeat(6_000)}null${"}".repeat(6_000)}`;
+    const poisonJson = `{"event_id":53,"event_type":"bot_task","event_data":${JSON.stringify(poisonData).slice(0, -1)},"context":${deepContextJson}}}`;
+    const responseBody = `{"results":[${poisonJson},${JSON.stringify(botTaskEvent(54))}]}`;
+    global.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (String(url).endsWith("/ack")) {
+        acked.push(String(url));
+        return new Response("");
+      }
+      return new Response(responseBody, {
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    const errors: string[] = [];
+    const cursor = memoryCursor(52);
+    const onBotTask = vi.fn();
+    const poller = startEventPoller({
+      apiUrl: "https://api.test",
+      botToken: "bf_x",
+      intervalMs: 1000,
+      cursorStore: cursor,
+      onBotTask,
+      log: { error: (message) => errors.push(message) },
+    });
+
+    await poller.ready;
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(errors.join("\n")).toContain("invalid bot_task event 53");
+    expect(onBotTask).toHaveBeenCalledOnce();
+    expect(onBotTask.mock.calls[0][0].eventId).toBe(54);
+    expect(acked).toEqual([
+      "https://api.test/v1/bot/events/53/ack",
+      "https://api.test/v1/bot/events/54/ack",
+    ]);
+    expect(cursor.saved).toEqual([53, 54]);
     poller.stop();
   });
 

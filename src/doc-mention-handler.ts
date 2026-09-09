@@ -64,6 +64,10 @@ export type DocMentionDispatch = (
        * 累计:后续 notice-only 不能覆盖此前已经落地的 final。
        */
       reportTurn: (report: DocTaskTurnReport) => void;
+      /** Bot Task 超时后中止底层 Agent，防止已失去监管的回合继续写业务数据。 */
+      abortOnTimeout?: boolean;
+      /** 立即在将回合交给 Agent runtime 前调用。 */
+      onAgentTurnStarted?: () => void | Promise<void>;
     };
   },
 ) => Promise<"completed" | "dropped">;

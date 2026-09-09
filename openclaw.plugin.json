@@ -83,7 +83,12 @@
           "docTasks": {
             "type": "boolean",
             "default": true,
-            "description": "Document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM. Enabled by default; set false to run the account as a plain IM bot."
+            "description": "Document comment @Bot tasks: routes task replies to the doc comment thread instead of IM. Enabled by default; false disables document tasks only. Event polling may remain active for generic Bot Tasks or interactive cards."
+          },
+          "botTasks": {
+            "type": "boolean",
+            "default": true,
+            "description": "Generic server-issued Bot Tasks: runs the supplied business prompt in an isolated agent turn and requires business output through octo-cli. Enabled by default; set false to disable generic task execution. Set both botTasks and docTasks to false when the account should not run background tasks."
           },
           "accounts": {
             "type": "object",
@@ -148,7 +153,12 @@
                 "docTasks": {
                   "type": "boolean",
                   "default": true,
-                  "description": "Document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM. Enabled by default; set false to run the account as a plain IM bot."
+                  "description": "Document comment @Bot tasks: routes task replies to the doc comment thread instead of IM. Enabled by default; false disables document tasks only. Event polling may remain active for generic Bot Tasks or interactive cards."
+                },
+                "botTasks": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Generic server-issued Bot Tasks: runs the supplied business prompt in an isolated agent turn and requires business output through octo-cli. Enabled by default; set false to disable generic task execution. Set both botTasks and docTasks to false when the account should not run background tasks."
                 },
                 "onBehalfOf": {
                   "type": "string",

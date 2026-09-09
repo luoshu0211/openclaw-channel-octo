@@ -58,6 +58,8 @@ import { createFileDocMentionDedupeStore } from "./doc-mention-dedupe.js";
 import { createFileDocTaskDeadLetterStore } from "./doc-task-deadletter.js";
 import { createDocMentionHandler, DOC_TASK_NOTICE_TIMEOUT_MS } from "./doc-mention-handler.js";
 import { handleCardAction } from "./card-action-handler.js";
+import { createBotTaskHandler } from "./bot-task-handler.js";
+import { createFileBotTaskStateStore } from "./bot-task-store.js";
 
 /**
  * 会话初始化冲突(core CAS)兜底重试参数。同群紧挨两条消息时,turn N 的 session 收尾写
@@ -861,6 +863,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         uidToNameMap,
         groupMdCache,
         currentChannelId: ctx.toolContext?.currentChannelId ?? undefined,
+        sessionKey: ctx.sessionKey ?? undefined,
         threadId: ctx.toolContext?.threadId ?? ctx.params?.threadId ?? undefined,
         requesterSenderId: ctx.requesterSenderId ?? undefined,
         accountId,
@@ -1545,6 +1548,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
       // 文档评论 @Bot 任务。持久去重:轮询器先执行后存游标,server 侧也可能在
       // enqueue 后 confirm 前崩溃重投,两条路径都靠 idempotency_key 收敛。
       const docTasksEnabled = account.config.docTasks === true;
+      const botTasksEnabled = account.config.botTasks === true;
       // 配置写错类型时说清楚。解析器只兜底 nullish,所以非布尔值(典型是 JSON 里写成
       // 字符串 "true")原样透传到这里,被下面的严格 `=== true` 拒掉 —— 得到的是**默认值
       // 的反面**:本想开,结果比不写还少。这条门禁本身是对的(不能让写错的配置静默半开),
@@ -1554,6 +1558,13 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           `[octo:doc-tasks] [${account.accountId}] docTasks 必须是布尔值,收到 ` +
             `${typeof account.config.docTasks} —— 文档评论 @Bot 任务**已关闭**(门禁只认布尔 true)。` +
             `想开就写 docTasks: true(不带引号);想关就写 docTasks: false。`,
+        );
+      }
+      if (account.config.botTasks !== undefined && typeof account.config.botTasks !== "boolean") {
+        console.warn(
+          `[octo:bot-tasks] [${account.accountId}] botTasks must be boolean; received ` +
+            `${typeof account.config.botTasks}. Generic Bot Tasks are disabled. ` +
+            `Use botTasks: true or botTasks: false without quotes.`,
         );
       }
       // log 必须传:去重表读不出来时(EACCES / JSON 截断)会退化成空表,
@@ -1604,6 +1615,17 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
         log,
       });
 
+      // The payload carries the complete business prompt; this adapter does not branch on
+      // source/task_type. Operators retain an explicit kill switch for background execution.
+      const handleBotTask = botTasksEnabled
+        ? createBotTaskHandler({
+            botUid: credentials.robot_id,
+            store: createFileBotTaskStateStore({ accountId: account.accountId, log }),
+            dispatch: dispatchInboundMessage,
+            log,
+          })
+        : undefined;
+
       let cardEventPoller: EventPoller | undefined;
       const startCardEventPoller = (): void => {
         if (cardEventPoller || stopped) return;
@@ -1614,6 +1636,7 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           waitSeconds: account.config.eventWaitSeconds,
           cursorStore: createFileEventCursorStore({ accountId: account.accountId }),
           log,
+          ...(handleBotTask ? { onBotTask: handleBotTask } : {}),
           ...(docTasksEnabled ? { onDocMention: handleDocMention } : {}),
           // 本地 cardInteraction 已废弃(服务端 per-Bot interaction_enabled 权威),
           // 这里无条件注册,与 main 保持一致。
@@ -1640,16 +1663,15 @@ export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
           },
         });
         log?.info?.(
-          `octo: [${account.accountId}] bot event poller started (doc_tasks=${docTasksEnabled})`,
+          `octo: [${account.accountId}] bot event poller started (bot_tasks=${botTasksEnabled} doc_tasks=${docTasksEnabled})`,
         );
       };
       // 保留 main 的形态:轮询器仍是懒启动,但注册不再被本地 cardInteraction 门控 —— 任何
       // card-profile 消费者都可以启动它,好让 bot_setting_updated 能作废该 Bot 的缓存策略。
       setCardEventPollStarter(account.accountId, startCardEventPoller);
       if (process.env.OCTO_CARD_POLL_FORCE === "1") startCardEventPoller();
-      // 文档任务必须常驻轮询:上面是「发过卡片才懒启动」的,而 doc bot 可能从不发卡片,
-      // 不常驻就永远收不到 doc_comment_mention。
-      if (docTasksEnabled) startCardEventPoller();
+      // 后台任务必须常驻轮询；只启用交互卡片时仍保持懒启动。
+      if (docTasksEnabled || botTasksEnabled) startCardEventPoller();
 
       // 6. Connect WebSocket — pure real-time
       const socket = new WKSocket({

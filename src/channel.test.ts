@@ -162,6 +162,28 @@ describe("octoPlugin structure", () => {
     expect(octoPlugin.capabilities?.chatTypes).toContain("direct");
     expect(octoPlugin.capabilities?.chatTypes).toContain("group");
   });
+
+  it("forwards the Bot Task session key to the message-action egress fence", async () => {
+    const { octoPlugin } = await import("./channel.js");
+
+    const result = await (octoPlugin.actions as any).handleAction({
+      channel: "octo",
+      action: "send",
+      cfg: {
+        channels: {
+          octo: {
+            botToken: "test-token",
+            apiUrl: "http://localhost:8090",
+          },
+        },
+      },
+      accountId: "default",
+      params: { target: "user:uid_victim", message: "business data" },
+      sessionKey: "agent:main:octo:default:octo:bot-task:bot-1:loop:issue\\:1",
+    });
+
+    expect(JSON.stringify(result)).toMatch(/generic Bot Task sessions/i);
+  });
 });
 
 // ─── Group → Account mapping tests ──────────────────────────────────────────

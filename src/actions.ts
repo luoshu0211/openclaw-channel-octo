@@ -7,7 +7,16 @@
 
 import { ChannelType, MessageType, RICH_TEXT_BLOCK_IMAGE, RICH_TEXT_BLOCK_TEXT, RICH_TEXT_IMAGE_PLACEHOLDER } from "./types.js";
 import type { MentionEntity, LogSink, RichTextBlock } from "./types.js";
-import { stripAllChannelPrefixes, isDocTaskNonRoutableTarget, DOC_TASK_ALLOWED_MESSAGE_ACTIONS } from "./constants.js";
+import {
+  stripAllChannelPrefixes,
+  isDocTaskNonRoutableTarget,
+  isDocTaskSessionKey,
+  isBotTaskSessionKey,
+  isExternalTaskSessionKey,
+  DOC_TASK_NON_ROUTABLE_PREFIX,
+  DOC_TASK_ALLOWED_MESSAGE_ACTIONS,
+  BOT_TASK_ALLOWED_MESSAGE_ACTIONS,
+} from "./constants.js";
 import { collapseParentScope, normalizeOutboundChannelPrefix, parseTarget, resolveOutboundTarget } from "./target.js";
 import {
   sendMessage,
@@ -111,12 +120,13 @@ export async function handleOctoMessageAction(params: {
   uidToNameMap?: Map<string, string>;
   groupMdCache?: Map<string, { content: string; version: number }>;
   currentChannelId?: string;
+  sessionKey?: string;
   threadId?: string | number | null;
   requesterSenderId?: string;
   accountId?: string;
   log?: LogSink;
 }): Promise<MessageActionResult> {
-  const { action, args, apiUrl, botToken, memberMap, uidToNameMap, groupMdCache, currentChannelId, threadId, requesterSenderId, accountId, log } =
+  const { action, args, apiUrl, botToken, memberMap, uidToNameMap, groupMdCache, currentChannelId, sessionKey, threadId, requesterSenderId, accountId, log } =
     params;
 
   if (!botToken) {
@@ -143,18 +153,41 @@ export async function handleOctoMessageAction(params: {
   //
   // 判据用 `currentChannelId`(会话上下文,文档回合里是哨兵),不是 args.target ——
   // target 是攻击者控制的输入,拿它做判据等于让攻击者自己声明合不合法。
-  if (isDocTaskNonRoutableTarget(currentChannelId) && !DOC_TASK_ALLOWED_MESSAGE_ACTIONS.has(action)) {
+  // The non-routable target is plugin-authored and embeds the task scope, while
+  // sessionKey is optional host context. Classify from the sentinel suffix
+  // first, then use sessionKey as a compatibility fallback. Bot Task wins when
+  // both predicates match (for example source="doctask"), so an untrusted
+  // actor_uid can never acquire document requester-scoped reads.
+  const bareCurrentChannelId = currentChannelId
+    ? stripAllChannelPrefixes(currentChannelId.trim())
+    : undefined;
+  const sentinelScope = bareCurrentChannelId?.startsWith(DOC_TASK_NON_ROUTABLE_PREFIX)
+    ? bareCurrentChannelId.slice(DOC_TASK_NON_ROUTABLE_PREFIX.length)
+    : undefined;
+  const externalTaskTurn = sentinelScope !== undefined || isExternalTaskSessionKey(sessionKey);
+  const botTaskSession = isBotTaskSessionKey(sentinelScope) || isBotTaskSessionKey(sessionKey);
+  const documentTaskTurn = externalTaskTurn && !botTaskSession &&
+    (isDocTaskSessionKey(sentinelScope) || isDocTaskSessionKey(sessionKey));
+  const botTaskTurn = externalTaskTurn && !documentTaskTurn;
+  const allowedActions = botTaskTurn
+    ? BOT_TASK_ALLOWED_MESSAGE_ACTIONS
+    : DOC_TASK_ALLOWED_MESSAGE_ACTIONS;
+  if ((botTaskTurn || documentTaskTurn) && !allowedActions.has(action)) {
+    const taskKind = documentTaskTurn ? "document-comment task sessions" : "generic Bot Task sessions";
     return {
       ok: false,
-      error:
-        `document-comment task sessions may only use ${[...DOC_TASK_ALLOWED_MESSAGE_ACTIONS].join(" / ")} ` +
-        `(requester-scoped reads) — action "${action}" is not available; reply in the document comment thread instead`,
+      error: botTaskTurn
+        ? `${taskKind} cannot use message actions — action "${action}" is not available; ` +
+          "use the source-specific octo-cli output mechanism instead"
+        : `${taskKind} may only use ${[...allowedActions].join(" / ")} ` +
+          `(requester-scoped reads) — action "${action}" is not available; ` +
+          "reply in the document comment thread instead",
     };
   }
 
   switch (action) {
     case "send":
-      return handleSend({ args, apiUrl, botToken, memberMap, uidToNameMap, currentChannelId, threadId, log });
+      return handleSend({ args, apiUrl, botToken, memberMap, uidToNameMap, currentChannelId, sessionKey, threadId, log });
     case "read":
       return handleRead({ args, apiUrl, botToken, uidToNameMap, currentChannelId, requesterSenderId, accountId, log });
     case "search":
@@ -372,10 +405,11 @@ async function handleSend(params: {
   memberMap?: Map<string, string>;
   uidToNameMap?: Map<string, string>;
   currentChannelId?: string;
+  sessionKey?: string;
   threadId?: string | number | null;
   log?: LogSink;
 }): Promise<MessageActionResult> {
-  const { args, apiUrl, botToken, memberMap, uidToNameMap, currentChannelId, threadId, log } = params;
+  const { args, apiUrl, botToken, memberMap, uidToNameMap, currentChannelId, sessionKey, threadId, log } = params;
 
   // ★ 文档任务会话没有 IM 目标 —— 这里是**显式目标**那一半。
   //
@@ -394,11 +428,13 @@ async function handleSend(params: {
   // read / search 不在此拒绝:它们在 actions.ts 的跨频道检查里按**发起人身份**
   // (requesterSenderId = 评论作者)判权限,读不到发起人本来读不到的东西。这是
   // 刻意保留的,不是漏加。
-  if (isDocTaskNonRoutableTarget(currentChannelId)) {
+  if (isDocTaskNonRoutableTarget(currentChannelId) || isExternalTaskSessionKey(sessionKey)) {
     return {
       ok: false,
       error:
-        "document-comment task sessions have no IM destination — reply in the document comment thread instead of sending to a chat target",
+        isDocTaskNonRoutableTarget(currentChannelId)
+          ? "document-comment task sessions have no IM destination — reply in the document comment thread instead of sending to a chat target"
+          : "generic Bot Task sessions have no IM destination — use the source-specific octo-cli output mechanism instead of sending to a chat target",
     };
   }
 

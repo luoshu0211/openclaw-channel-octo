@@ -5,11 +5,15 @@ import {
   resolveDispatchTimeoutMs,
   _setDispatchTimeoutForTests,
   _setDispatchApologyTimeoutForTests,
+  _setDispatchAbortGraceForTests,
 } from "./inbound.js";
 import { setOctoRuntime } from "./runtime.js";
 import { _clearKnownBots } from "./bot-registry.js";
 import { resolveOctoAccount } from "./accounts.js";
 import type { ResolvedOctoAccount } from "./accounts.js";
+import { createBotTaskHandler } from "./bot-task-handler.js";
+import type { BotTaskStateStore } from "./bot-task-store.js";
+import { botTaskDedupeKey } from "./bot-task.js";
 
 /**
  * Regression tests for issue #75 — upstream
@@ -29,11 +33,10 @@ import type { ResolvedOctoAccount } from "./accounts.js";
  *      queue.
  *   4. Timeout handle is cleared in finally on every path.
  *
- * Out of scope (tracked separately): cancellation of an already-in-flight
- * upstream dispatch / suppression of late deliver/onError callbacks from a
- * dispatch that "wakes up" after our timeout. If the upstream resumes, the
- * worst outcome is a delayed real reply on top of the apology — annoying,
- * not broken.
+ * Bot Task dispatches additionally receive an AbortSignal. Their queue slot is
+ * held for a bounded cancellation grace period; a non-cooperative dispatcher
+ * is then treated as already started so the task can be dead-lettered without
+ * replay, including when it fulfils during the cancellation grace period.
  */
 
 const API = "http://octo.test";
@@ -51,6 +54,7 @@ const originalClearTimeout = globalThis.clearTimeout;
 // by delay.
 const TIMEOUT_MS_FOR_TESTS = 100;
 const APOLOGY_TIMEOUT_MS_FOR_TESTS = 150;
+const ABORT_GRACE_MS_FOR_TESTS = 30;
 
 function makeAccount(): ResolvedOctoAccount {
   return {
@@ -235,6 +239,7 @@ function pickTimeoutSends(sends: any[]) {
 function runInbound(opts: {
   log?: any;
   routeOverride?: { sessionKey: string; agentId?: string };
+  docTask?: Parameters<typeof handleInboundMessage>[0]["docTask"];
 } = {}) {
   return handleInboundMessage({
     account: makeAccount(),
@@ -247,18 +252,42 @@ function runInbound(opts: {
     groupCacheTimestamps: new Map(),
     log: opts.log,
     routeOverride: opts.routeOverride,
+    docTask: opts.docTask,
   });
+}
+
+function createInboundBackedBotTaskDispatch(
+  log: any,
+): Parameters<typeof createBotTaskHandler>[0]["dispatch"] {
+  return async (message, routeOverride, extra) => {
+    await handleInboundMessage({
+      account: makeAccount(),
+      message,
+      botUid: BOT_UID,
+      groupHistories: new Map(),
+      lastBotReplySeqMap: new Map(),
+      memberMap: new Map(),
+      uidToNameMap: new Map(),
+      groupCacheTimestamps: new Map(),
+      log,
+      routeOverride,
+      docTask: extra.docTask,
+    });
+    return "completed";
+  };
 }
 
 beforeEach(() => {
   _clearKnownBots();
   _setDispatchTimeoutForTests(TIMEOUT_MS_FOR_TESTS);
   _setDispatchApologyTimeoutForTests(APOLOGY_TIMEOUT_MS_FOR_TESTS);
+  _setDispatchAbortGraceForTests(ABORT_GRACE_MS_FOR_TESTS);
 });
 
 afterEach(() => {
   _setDispatchTimeoutForTests(null);
   _setDispatchApologyTimeoutForTests(null);
+  _setDispatchAbortGraceForTests(null);
   globalThis.fetch = originalFetch;
   globalThis.setTimeout = originalSetTimeout;
   globalThis.clearTimeout = originalClearTimeout;
@@ -266,6 +295,110 @@ afterEach(() => {
 });
 
 describe("dispatch timeout guard (issue #75)", () => {
+  it("started-state failure does not block Bot Task handoff to the real inbound dispatcher", async () => {
+    const { dispatch: runtimeDispatch } = installImmediateRuntime();
+    installFetchStub();
+    const errors: string[] = [];
+    const store: BotTaskStateStore = {
+      begin: vi.fn().mockResolvedValue({ skip: false, attemptCount: 1 }),
+      started: vi.fn().mockRejectedValue(new Error("state file temporarily unreadable")),
+      finish: vi.fn().mockResolvedValue(undefined),
+      retry: vi.fn().mockResolvedValue(undefined),
+    };
+    const log = {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: (message: string) => errors.push(message),
+    };
+    const handle = createBotTaskHandler({
+      botUid: BOT_UID,
+      store,
+      log,
+      dispatch: createInboundBackedBotTaskDispatch(log),
+    });
+
+    const task = {
+      eventId: 41,
+      source: "loop",
+      taskType: "loop_issue_comment_mention",
+      idempotencyKey: "comment-1:bot-1",
+      botUid: BOT_UID,
+      actorUid: HUMAN_UID,
+      sessionKey: "issue:1:thread:2",
+      prompt: "Review the issue and reply if needed.",
+      context: { issue_id: "1" },
+    };
+    await expect(handle(task)).resolves.toBeUndefined();
+
+    expect(runtimeDispatch).toHaveBeenCalledOnce();
+    expect(store.retry).not.toHaveBeenCalled();
+    expect(store.finish).toHaveBeenCalledWith(41, botTaskDedupeKey(task), "completed");
+    expect(errors.some((message) => message.includes("started-boundary state write failed"))).toBe(true);
+  });
+
+  it.each(["runtime missing", "route resolution failure"] as const)(
+    "retries Bot Tasks when inbound exits before handoff: %s",
+    async (failure) => {
+      const runtimeDispatch = vi.fn().mockResolvedValue(undefined);
+      setOctoRuntime({
+        config: { current: () => ({}) },
+        channel: {
+          reply: {
+            ...(failure === "runtime missing"
+              ? {}
+              : { dispatchReplyWithBufferedBlockDispatcher: runtimeDispatch }),
+            resolveEnvelopeFormatOptions: () => ({}),
+            formatAgentEnvelope: ({ body }: any) => body,
+            finalizeInboundContext: (ctx: any) => ctx,
+          },
+          routing: {
+            resolveAgentRoute: () => {
+              if (failure === "route resolution failure") throw new Error("route unavailable");
+              return { agentId: "agent1", sessionKey: "sk1", accountId: "acct1" };
+            },
+          },
+          session: {
+            resolveStorePath: () => "/tmp/store",
+            readSessionUpdatedAt: () => undefined,
+            recordInboundSession: async () => {},
+          },
+        },
+      } as any);
+      installFetchStub();
+      const store: BotTaskStateStore = {
+        begin: vi.fn().mockResolvedValue({ skip: false, attemptCount: 1 }),
+        started: vi.fn().mockResolvedValue(undefined),
+        finish: vi.fn().mockResolvedValue(undefined),
+        retry: vi.fn().mockResolvedValue(undefined),
+      };
+      const log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+      const handle = createBotTaskHandler({
+        botUid: BOT_UID,
+        store,
+        log,
+        dispatch: createInboundBackedBotTaskDispatch(log),
+      });
+
+      await expect(handle({
+        eventId: 42,
+        source: "loop",
+        taskType: "loop_issue_comment_mention",
+        idempotencyKey: `pre-handoff:${failure}`,
+        botUid: BOT_UID,
+        actorUid: HUMAN_UID,
+        sessionKey: "issue:2:thread:3",
+        prompt: "Review the issue.",
+        context: { issue_id: "2" },
+      })).rejects.toThrow("completed before Agent turn started");
+
+      expect(runtimeDispatch).not.toHaveBeenCalled();
+      expect(store.started).not.toHaveBeenCalled();
+      expect(store.finish).not.toHaveBeenCalled();
+      expect(store.retry).toHaveBeenCalledOnce();
+    },
+  );
+
   it("可信 route override 保持原始 sessionKey", async () => {
     const { dispatch } = installImmediateRuntime();
     installFetchStub();
@@ -289,6 +422,158 @@ describe("dispatch timeout guard (issue #75)", () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(pickTimeoutSends(sends)).toHaveLength(1);
     expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("dispatch hung"))).toBe(true);
+  });
+
+  it("bot task timeout propagates a dispatcher rejection after waiting for it to settle", async () => {
+    let abortObserved = false;
+    let dispatchSettled = false;
+    const dispatch = vi.fn(async (args: any) => {
+      const signal = args.replyOptions.abortSignal as AbortSignal | undefined;
+      expect(signal).toBeInstanceOf(AbortSignal);
+      await new Promise<void>((_resolve, reject) => {
+        signal!.addEventListener("abort", () => {
+          abortObserved = true;
+          setTimeout(() => {
+            dispatchSettled = true;
+            reject(signal!.reason);
+          }, 20);
+        }, { once: true });
+      });
+    });
+    setOctoRuntime({
+      config: { current: () => ({}) },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: dispatch,
+          resolveEnvelopeFormatOptions: () => ({}),
+          formatAgentEnvelope: ({ body }: any) => body,
+          finalizeInboundContext: (ctx: any) => ctx,
+        },
+        routing: { resolveAgentRoute: () => ({ agentId: "agent1", sessionKey: "sk1", accountId: "acct1" }) },
+        session: {
+          resolveStorePath: () => "/tmp/store",
+          readSessionUpdatedAt: () => undefined,
+          recordInboundSession: async () => {},
+        },
+      },
+    } as any);
+    installFetchStub();
+
+    const reports: any[] = [];
+    await expect(runInbound({
+      log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+      docTask: {
+        docId: "loop",
+        threadId: "issue-1",
+        sessionScope: "octo:bot-task:bot-1:loop:issue-1",
+        abortOnTimeout: true,
+        postComment: async () => {},
+        reportTurn: (report) => reports.push(report),
+      },
+    })).rejects.toThrow("dispatch timed out");
+
+    expect(abortObserved).toBe(true);
+    expect(dispatchSettled).toBe(true);
+    expect(reports).toHaveLength(1);
+  });
+
+  it("bot task timeout stays terminal when the turn fulfils during cancellation grace", async () => {
+    let abortObserved = false;
+    const dispatch = vi.fn(async (args: any) => {
+      const signal = args.replyOptions.abortSignal as AbortSignal;
+      await new Promise<void>((resolve) => {
+        signal.addEventListener("abort", () => {
+          abortObserved = true;
+          setTimeout(resolve, 20);
+        }, { once: true });
+      });
+    });
+    setOctoRuntime({
+      config: { current: () => ({}) },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: dispatch,
+          resolveEnvelopeFormatOptions: () => ({}),
+          formatAgentEnvelope: ({ body }: any) => body,
+          finalizeInboundContext: (ctx: any) => ctx,
+        },
+        routing: { resolveAgentRoute: () => ({ agentId: "agent1", sessionKey: "sk1", accountId: "acct1" }) },
+        session: {
+          resolveStorePath: () => "/tmp/store",
+          readSessionUpdatedAt: () => undefined,
+          recordInboundSession: async () => {},
+        },
+      },
+    } as any);
+    installFetchStub();
+    const reports: any[] = [];
+
+    await expect(runInbound({
+      log: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+      docTask: {
+        docId: "loop",
+        threadId: "issue-1",
+        sessionScope: "octo:bot-task:bot-1:loop:issue-1",
+        abortOnTimeout: true,
+        postComment: async () => {},
+        reportTurn: (report) => reports.push(report),
+      },
+    })).rejects.toThrow("dispatch timed out");
+
+    expect(abortObserved).toBe(true);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({ noticed: false });
+  });
+
+  it("bot task timeout releases the queue after bounded grace when dispatch ignores abort", async () => {
+    const dispatch = vi.fn(async (args: any) => {
+      expect(args.replyOptions.abortSignal).toBeInstanceOf(AbortSignal);
+      await new Promise<void>(() => {});
+    });
+    setOctoRuntime({
+      config: { current: () => ({}) },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: dispatch,
+          resolveEnvelopeFormatOptions: () => ({}),
+          formatAgentEnvelope: ({ body }: any) => body,
+          finalizeInboundContext: (ctx: any) => ctx,
+        },
+        routing: { resolveAgentRoute: () => ({ agentId: "agent1", sessionKey: "sk1", accountId: "acct1" }) },
+        session: {
+          resolveStorePath: () => "/tmp/store",
+          readSessionUpdatedAt: () => undefined,
+          recordInboundSession: async () => {},
+        },
+      },
+    } as any);
+    installFetchStub();
+    const warnSpy = vi.fn();
+    const errorSpy = vi.fn(() => {
+      // The timeout diagnostic must be visible before the grace period expires.
+      expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("dispatch hung"))).toBe(true);
+    });
+    const reports: any[] = [];
+
+    const inbound = runInbound({
+      log: { debug: () => {}, info: () => {}, warn: warnSpy, error: errorSpy },
+      docTask: {
+        docId: "loop",
+        threadId: "issue-1",
+        sessionScope: "octo:bot-task:bot-1:loop:issue-1",
+        abortOnTimeout: true,
+        postComment: async () => {},
+        reportTurn: (report) => reports.push(report),
+      },
+    });
+
+    await expect(Promise.race([
+      inbound,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("queue remained blocked")), 1_000)),
+    ])).rejects.toThrow("dispatch timed out");
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(errorSpy.mock.calls.some((call) => String(call[0]).includes("ignored abort"))).toBe(true);
+    expect(reports).toHaveLength(1);
   });
 
   // --- 超时提示的抑制条件 ---

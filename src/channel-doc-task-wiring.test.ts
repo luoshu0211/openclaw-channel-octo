@@ -39,9 +39,30 @@ vi.mock("./socket.js", () => ({
     async disconnectAndWait() {}
     stopReconnectTimer() {}
     send() {}
+    isConnected() { return false; }
+    // Keep the production watchdog quiescent in this wiring test. Connection
+    // recovery has dedicated coverage; these cases exercise event routing.
+    isConnectingOrConnected() { return true; }
+    hasPendingReconnect() { return false; }
     get connected() { return false; }
   },
 }));
+
+// Preserve the production retry count and error classification while removing
+// the 15 seconds of wall-clock backoff from every conflict-routing assertion.
+// Several conflict cases run in this file; real sleeps make them contend with
+// the per-test timeout and can leave a timed-out attempt mutating the next
+// test's shared spies.
+vi.mock("./session-retry.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./session-retry.js")>();
+  return {
+    ...actual,
+    runWithSessionInitRetry: (
+      task: () => Promise<void>,
+      opts: Parameters<typeof actual.runWithSessionInitRetry>[1],
+    ) => actual.runWithSessionInitRetry(task, { ...opts, sleep: async () => {} }),
+  };
+});
 
 vi.mock("./events-poll.js", () => ({
   startEventPoller: (options: unknown) => startEventPoller(options as never),
@@ -222,7 +243,7 @@ describe("accounts.ts 默认值 → channel.ts 门禁:未配置的账号真的�
     }
   });
 
-  it("openclaw.json 里写了 docTasks: false ⇒ 常驻轮询器不启动(退出方式仍然有效)", async () => {
+  it("openclaw.json 里写了 docTasks: false ⇒ 只关闭文档任务，默认 Bot Task 仍常驻", async () => {
     const { resolveOctoAccount } = await import("./accounts.js");
     const resolved = resolveOctoAccount({
       cfg: {
@@ -239,8 +260,59 @@ describe("accounts.ts 默认值 → channel.ts 门禁:未配置的账号真的�
     const stop = await startAccount(resolved.config as unknown as Record<string, unknown>);
     try {
       expect(pollerOptions().filter((o) => o.onDocMention !== undefined)).toEqual([]);
+      expect(pollerOptions().filter((o) => typeof o.onBotTask === "function")).toHaveLength(1);
     } finally {
       await stop();
+    }
+  });
+});
+
+describe("channel.ts:botTasks 独立门禁与生产接线", () => {
+  it("botTasks:true + docTasks:false ⇒ 常驻轮询且只注册通用任务 handler", async () => {
+    const stop = await startAccount({ botTasks: true, docTasks: false });
+    try {
+      const options = pollerOptions();
+      expect(options).toHaveLength(1);
+      expect(options[0]?.onBotTask).toEqual(expect.any(Function));
+      expect(options[0]?.onDocMention).toBeUndefined();
+    } finally {
+      await stop();
+    }
+  });
+
+  it("botTasks:false + docTasks:true ⇒ 文档任务常驻但不注册通用任务 handler", async () => {
+    const stop = await startAccount({ botTasks: false, docTasks: true });
+    try {
+      const options = pollerOptions();
+      expect(options).toHaveLength(1);
+      expect(options[0]?.onBotTask).toBeUndefined();
+      expect(options[0]?.onDocMention).toEqual(expect.any(Function));
+    } finally {
+      await stop();
+    }
+  });
+
+  it("botTasks:false + docTasks:false ⇒ 不启动后台任务轮询", async () => {
+    const stop = await startAccount({ botTasks: false, docTasks: false });
+    try {
+      expect(pollerOptions()).toEqual([]);
+    } finally {
+      await stop();
+    }
+  });
+
+  it("botTasks 写成字符串时关闭并输出可诊断告警", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stop = await startAccount({ botTasks: "true", docTasks: false });
+    try {
+      expect(pollerOptions()).toEqual([]);
+      const message = warn.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(message).toContain("botTasks");
+      expect(message).toContain("string");
+      expect(message).toContain("acct1");
+    } finally {
+      await stop();
+      warn.mockRestore();
     }
   });
 });
@@ -498,4 +570,3 @@ describe("channel.ts:notice-only 路径在 HTML 文档上不得渲染成 applied
     }
   }, 60_000);
 });
-

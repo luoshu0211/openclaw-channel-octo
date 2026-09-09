@@ -167,7 +167,7 @@ describe("createOctoManagementTools", () => {
       async (action) => {
         const execute = executeWith({ deliveryContext: { to: "doctask-no-im:d1#c70" } });
         const out = parseText(await execute("t", { action, groupId: "g1" }));
-        expect(String(out.error)).toContain("document-comment task sessions");
+        expect(String(out.error)).toContain("external task sessions");
       },
     );
 
@@ -176,7 +176,18 @@ describe("createOctoManagementTools", () => {
       async (action) => {
         const execute = executeWith({ sessionKey: "agent:main:octo:default:doctask:d1:70" });
         const out = parseText(await execute("t", { action, groupId: "g1" }));
-        expect(String(out.error)).toContain("document-comment task sessions");
+        expect(String(out.error)).toContain("external task sessions");
+      },
+    );
+
+    it.each(MGMT_ACTIONS)(
+      "只有 bot-task 会话键(宿主未给 deliveryContext)时,%s 同样必须被拒",
+      async (action) => {
+        const execute = executeWith({
+          sessionKey: "agent:main:octo:default:octo:bot-task:bot-1:loop:issue\\:1",
+        });
+        const out = parseText(await execute("t", { action, groupId: "g1" }));
+        expect(String(out.error)).toContain("external task sessions");
       },
     );
 
@@ -187,10 +198,17 @@ describe("createOctoManagementTools", () => {
       expect(vi.mocked(getGroupMd)).not.toHaveBeenCalled();
     });
 
+    it("拒绝提示对文档与 Bot Task 都保持业务中立", async () => {
+      const execute = executeWith({ sessionKey: "agent:main:octo:default:doctask:d1:70" });
+      const out = parseText(await execute("t", { action: "group-md-update", groupId: "g1" }));
+      expect(String(out.error)).toContain("output mechanism specified by the external task");
+      expect(String(out.error)).not.toContain("source-specific octo-cli");
+    });
+
     it("普通 IM 回合不受影响 —— 门控不能误伤正常会话", async () => {
       const execute = executeWith({ sessionKey: "agent:main:octo:default:g1", deliveryContext: { to: "group:g1" } });
       const out = parseText(await execute("t", { action: "list-groups" }));
-      expect(String(out.error ?? "")).not.toContain("document-comment task sessions");
+      expect(String(out.error ?? "")).not.toContain("external task sessions");
     });
   });
 

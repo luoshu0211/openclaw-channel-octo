@@ -16,9 +16,9 @@ import {
   resolveDefaultOctoAccountId,
 } from "./accounts.js";
 import {
-  DOC_TASK_ALLOWED_MANAGEMENT_ACTIONS,
+  EXTERNAL_TASK_ALLOWED_MANAGEMENT_ACTIONS,
   isDocTaskNonRoutableTarget,
-  isDocTaskSessionKey,
+  isExternalTaskSessionKey,
 } from "./constants.js";
 import {
   fetchBotGroups,
@@ -558,7 +558,7 @@ export function createOctoManagementTools(params: {
   cfg?: OpenClawConfig;
   agentAccountId?: string;
   agentId?: string;
-  /** 当前回合的会话键。文档任务回合据此整体门控 —— 见下方 docTaskTurn。 */
+  /** 当前回合的会话键。外部任务回合据此整体门控。 */
   sessionKey?: string;
   /** 宿主给的可信出站路由。文档任务回合里 `to` 是不可路由哨兵。 */
   deliveryContext?: { to?: string } | undefined;
@@ -568,18 +568,19 @@ export function createOctoManagementTools(params: {
   const agentId = params.agentId;
   if (!cfg) return [];
 
-  // 文档评论任务回合:这个工具的动作面(create-group / update-group / add-members /
+  // 外部任务回合:这个工具的动作面(create-group / update-group / add-members /
   // remove-members / delete-thread / thread-md-update / voice-context-* /
   // write-secret)全部跑在 **Bot 权限**下,且不带 requesterSenderId —— 与 message
   // 工具的 read/search 不同,它们不按发起人身份收敛。
   //
-  // 而文档回合的输入是**任何能在文档里留言的人**写的评论正文,那是提示注入的正面
-  // 入口。所以整只工具在文档回合里按允许集(当前为空集)门控。
+  // 文档评论和通用 Bot Task 的输入都来自 IM 会话外部,是提示注入的正面入口。
+  // 所以整只工具在外部任务回合里按允许集(当前为空集)门控。
   //
   // 判据取「哨兵 to」或「doctask 会话键」的**或**:tool-discovery 阶段宿主可能不传
   // deliveryContext,只有 sessionKey 是文档回合必带的。门控场合宁可误判、不可漏判。
-  const docTaskTurn =
-    isDocTaskNonRoutableTarget(params.deliveryContext?.to) || isDocTaskSessionKey(params.sessionKey);
+  const externalTaskTurn =
+    isDocTaskNonRoutableTarget(params.deliveryContext?.to) ||
+    isExternalTaskSessionKey(params.sessionKey);
 
   // Check if any account is configured
   try {
@@ -742,14 +743,14 @@ export function createOctoManagementTools(params: {
     ): Promise<ToolResult> => {
       const action = args.action as string;
 
-      // 文档回合的门控:在**动作分派之前**、在任何参数解析和网络调用之前。
+      // 外部任务回合的门控:在**动作分派之前**、在任何参数解析和网络调用之前。
       // 放在这里而不是各 case 里,理由与 actions.ts 的入口门控相同 —— 逐分支加守卫
       // 的清单靠人肉维护,新增 action 默认敞着。这里默认关着。
-      if (docTaskTurn && !DOC_TASK_ALLOWED_MANAGEMENT_ACTIONS.has(action)) {
+      if (externalTaskTurn && !EXTERNAL_TASK_ALLOWED_MANAGEMENT_ACTIONS.has(action)) {
         return makeError(
-          `octo_management is not available in document-comment task sessions (action "${action}" blocked): ` +
-            `its actions run with Bot-level authority and are not scoped to the comment author. ` +
-            `Reply in the document comment thread instead.`,
+          `octo_management is not available in external task sessions (action "${action}" blocked): ` +
+            `its actions run with Bot-level authority and are not scoped to the external task actor. ` +
+            `Use only the output mechanism specified by the external task.`,
         );
       }
 

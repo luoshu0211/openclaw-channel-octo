@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 
 import { CHANNEL_ID, DOC_TASK_NON_ROUTABLE_PREFIX } from "./constants.js";
+import { botTaskSessionScope } from "./bot-task.js";
 
 /**
  * 第五轮 review P1-1 的回归钉子：**文档任务会话里，message 工具不得往任何 IM 目标发消息**。
@@ -66,6 +67,7 @@ describe("P1-1 文档任务会话：message 工具的显式目标同样 fail-clo
       apiUrl: CHANNEL_HTTP,
       botToken: "test-token",
       currentChannelId: DOC_SESSION,
+      sessionKey: "agent:main:octo:default:doctask:doc-1:thread-1",
     });
 
     expect(result.ok).toBe(false);
@@ -94,6 +96,112 @@ describe("P1-1 文档任务会话：message 工具的显式目标同样 fail-clo
 
     expect(result.ok).toBe(false);
     expect(probe.calls.filter((u) => u.includes("sendMessage"))).toHaveLength(0);
+  });
+
+  it("通用 Bot Task 即使没有 currentChannelId，也不能向 IM 目标发送消息", async () => {
+    const probe = failIfAnySend();
+    const { handleOctoMessageAction } = await import("./actions.js");
+
+    const result = await handleOctoMessageAction({
+      action: "send",
+      args: { target: "user:uid_victim", message: "business data" },
+      apiUrl: CHANNEL_HTTP,
+      botToken: "test-token",
+      sessionKey: "agent:main:octo:default:octo:bot-task:bot-1:loop:issue\\:1",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toMatch(/generic Bot Task sessions/i);
+    expect(probe.calls).toHaveLength(0);
+  });
+
+  it("通用 Bot Task 的其他 Bot 权限写操作也由正向允许集默认拒绝", async () => {
+    const probe = failIfAnySend();
+    const { handleOctoMessageAction } = await import("./actions.js");
+
+    const result = await handleOctoMessageAction({
+      action: "group-md-update",
+      args: { target: "group:grp_public", content: "overwrite" },
+      apiUrl: CHANNEL_HTTP,
+      botToken: "test-token",
+      sessionKey: "agent:main:octo:default:octo:bot-task:bot-1:loop:issue\\:1",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toMatch(/generic Bot Task sessions/i);
+    expect(probe.calls).toHaveLength(0);
+  });
+
+  it.each(["read", "search"])(
+    "通用 Bot Task 不能把事件 actor_uid 冒充成所有者执行 %s",
+    async (action) => {
+      const probe = failIfAnySend();
+      const { handleOctoMessageAction } = await import("./actions.js");
+
+      const result = await handleOctoMessageAction({
+        action,
+        args: action === "read" ? { target: "group:private-owner-group" } : { query: "secret" },
+        apiUrl: CHANNEL_HTTP,
+        botToken: "test-token",
+        currentChannelId: DOC_SESSION,
+        sessionKey: "agent:main:octo:default:octo:bot-task:bot-1:loop:issue\\:1",
+        // Simulates an untrusted event claiming to be the Bot owner. The Bot
+        // Task kind must win over the shared document-task target sentinel.
+        requesterSenderId: "uid_bot_owner",
+      });
+
+      expect(result.ok).toBe(false);
+      expect(String(result.error)).toMatch(/generic Bot Task sessions/i);
+      expect(probe.calls).toHaveLength(0);
+    },
+  );
+
+  it("缺少可选 sessionKey 时，从插件生成的哨兵恢复文档任务类型并保留 read", async () => {
+    const probe = failIfAnySend();
+    const { handleOctoMessageAction } = await import("./actions.js");
+
+    const result = await handleOctoMessageAction({
+      action: "read",
+      args: { target: "user:uid_bot_owner" },
+      apiUrl: CHANNEL_HTTP,
+      botToken: "test-token",
+      currentChannelId: DOC_SESSION,
+      requesterSenderId: "uid_bot_owner",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(probe.calls.filter((url) => url.includes("/v1/bot/messages/sync"))).toHaveLength(1);
+    expect(probe.calls.filter((url) => url.includes("sendMessage"))).toHaveLength(0);
+  });
+
+  it("source=doctask 不能把通用 Bot Task 伪装成文档任务并放开 read", async () => {
+    const probe = failIfAnySend();
+    const { handleOctoMessageAction } = await import("./actions.js");
+    const scope = botTaskSessionScope({
+      eventId: 1,
+      source: "doctask",
+      taskType: "custom",
+      idempotencyKey: "key-1",
+      botUid: "bot-1",
+      actorUid: "uid_bot_owner",
+      sessionKey: "issue-1",
+      prompt: "task",
+      context: {},
+    });
+
+    const result = await handleOctoMessageAction({
+      action: "read",
+      args: { target: "group:private-owner-group" },
+      apiUrl: CHANNEL_HTTP,
+      botToken: "test-token",
+      currentChannelId: DOC_SESSION,
+      sessionKey: `agent:main:octo:default:${scope}`,
+      requesterSenderId: "uid_bot_owner",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toMatch(/generic Bot Task sessions/i);
+    expect(probe.calls).toHaveLength(0);
   });
 
   it("带媒体的调用也被拒（媒体路不在文本早退之前分叉）", async () => {

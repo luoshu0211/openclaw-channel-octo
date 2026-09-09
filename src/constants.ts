@@ -71,35 +71,41 @@ export function isDocTaskNonRoutableTarget(target: string | null | undefined): b
 }
 
 /**
- * 文档任务回合在 message 工具里**唯一允许**的 action 集合(正向允许集)。
+ * 外部任务回合在 message 工具里的 action 正向允许集。
  *
  * 为什么是允许集而不是拒绝集:前五轮的收口都是「再减一个出口」—— 逐个把
  * send / typing / 进度卡 / slash / fork 关掉,清单靠人肉枚举,每加一个新出口就
  * 默认敞着,直到下一轮评审把它找出来。允许集把默认反过来:**新分支默认关**,
- * 要开必须显式写进这里,于是「文档回合够得着什么」是一行可复核的声明,而不是
+ * 要开必须显式写进这里,于是「外部任务回合够得着什么」是一行可复核的声明,而不是
  * 一条需要逐分支重新推导的性质。
  *
- * 只留 read / search 的理由:这两条按**发起人身份**(requesterSenderId = 评论作者)
- * 判权限,读不到发起人本来读不到的东西 —— 它们不放大权限。其余分支(send /
- * member-info / channel-list / channel-info / group-md-read / group-md-update)
- * 一律跑在 Bot 权限下,其中 group-md-update 还是写操作。
+ * 文档评论任务保留 read / search:这两条按已认证评论作者的身份判权限。通用
+ * Bot Task 的 actor_uid 来自外部事件,不能作为 Octo 权限主体,所以其允许集为空。
  */
+/** Document comments retain requester-scoped reads for the existing workflow. */
 export const DOC_TASK_ALLOWED_MESSAGE_ACTIONS: ReadonlySet<string> = new Set(["read", "search"]);
 
 /**
- * 文档任务回合在 `octo_management` 工具里允许的 action 集合。
+ * Generic Bot Task identity is supplied by an external source and is not an
+ * authenticated Octo requester principal. Keep every message action closed;
+ * business I/O must go through the source-specific octo-cli capability.
+ */
+export const BOT_TASK_ALLOWED_MESSAGE_ACTIONS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * 外部任务回合在 `octo_management` 工具里允许的 action 集合。
  *
  * 该工具比 message 工具更宽:它带 create-group / update-group / add-members /
  * remove-members / delete-thread / thread-md-update / voice-context-* /
  * write-secret 这些**写与管理**动作,全部跑在 Bot 权限下,且不带 requesterSenderId。
  * 它不是默认开启的(需要 profile 里 tools.alsoAllow),但「配置上没开」不是边界,
- * 开了就洞开。所以这里给的是空集:**文档回合一个 management action 都不许用**。
+ * 开了就洞开。所以这里给的是空集:**外部任务回合一个 management action 都不许用**。
  *
  * 之所以留成一个具名空集而不是直接 `return error`:与上面那条同形,将来若确有
  * 只读的 management 动作需要放开(如 group-info),改动落在这一行、连带被测试钉住,
  * 而不是散进 execute 里的条件分支。
  */
-export const DOC_TASK_ALLOWED_MANAGEMENT_ACTIONS: ReadonlySet<string> = new Set<string>();
+export const EXTERNAL_TASK_ALLOWED_MANAGEMENT_ACTIONS: ReadonlySet<string> = new Set<string>();
 
 /**
  * 文档任务会话键的作用域片段(与 doc-mention.ts 的 `docTaskSessionScope` 同源)。
@@ -113,8 +119,9 @@ export const DOC_TASK_SESSION_SCOPE_PREFIX = "doctask:";
  *
  * 为什么不只看 `deliveryContext.to` 的哨兵:哨兵是**出站目标**,由 inbound 合成
  * 消息时写入;而插件工具工厂拿到的 ctx 里 `deliveryContext` 是可选字段,宿主在
- * 某些注册阶段(tool-discovery)根本不传。sessionKey 则是文档回合一定带的,
- * 且由 inbound.ts 用固定构造式写死。两个判据取**或**:任一命中即按文档回合处理 ——
+ * 某些注册阶段(tool-discovery)根本不传。sessionKey 由 inbound.ts 用固定构造式
+ * 写死,但在部分宿主 tool ctx 中仍是可选字段；拿得到时可作为兼容判据,拿不到时
+ * 消费者应从插件生成的不可路由哨兵中恢复 scope。两个判据取**或**:任一命中即按文档回合处理 ——
  * 门控这种场合,漏判(把文档回合当普通回合放行)比误判(把普通回合当文档回合拒掉)
  * 严重得多,所以往严的方向合并。
  *
@@ -124,6 +131,21 @@ export const DOC_TASK_SESSION_SCOPE_PREFIX = "doctask:";
 export function isDocTaskSessionKey(sessionKey: string | null | undefined): boolean {
   if (!sessionKey) return false;
   return /(^|:)doctask:/.test(sessionKey.trim());
+}
+
+/** Generic Bot Task scope emitted by botTaskSessionScope(). */
+export function isBotTaskSessionKey(sessionKey: string | null | undefined): boolean {
+  if (!sessionKey) return false;
+  return /(^|:)bot-task:/.test(sessionKey.trim());
+}
+
+/**
+ * External task turns accept prompts from systems outside the IM conversation.
+ * Tool discovery does not always include deliveryContext, so the session key is
+ * the fail-closed signal shared by document-comment and generic Bot Tasks.
+ */
+export function isExternalTaskSessionKey(sessionKey: string | null | undefined): boolean {
+  return isDocTaskSessionKey(sessionKey) || isBotTaskSessionKey(sessionKey);
 }
 
 

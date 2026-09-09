@@ -62,3 +62,28 @@ describe("resolveOctoAccount docTasks 默认值", () => {
     ).toBe("true");
   });
 });
+
+describe("resolveOctoAccount botTasks 默认值", () => {
+  const resolve = (octo: Record<string, unknown>, accountId: string) =>
+    resolveOctoAccount({ cfg: { channels: { octo } } as never, accountId }).config.botTasks;
+
+  it("两处都没配 ⇒ 默认开启", () => {
+    expect(resolve({ botToken: "root", accounts: { a1: { botToken: "t" } } }, "a1")).toBe(true);
+  });
+
+  it("账号级 false 可关闭，账号级配置覆盖顶层默认", () => {
+    const octo = {
+      botToken: "root",
+      botTasks: false,
+      accounts: { a1: { botToken: "t" }, a2: { botToken: "t", botTasks: true } },
+    };
+    expect(resolve(octo, "a1")).toBe(false);
+    expect(resolve(octo, "a2")).toBe(true);
+  });
+
+  it("非布尔真值原样透传，由 channel.ts 严格门禁拒绝", () => {
+    expect(
+      resolve({ botToken: "root", accounts: { a1: { botToken: "t", botTasks: "true" } } }, "a1"),
+    ).toBe("true");
+  });
+});

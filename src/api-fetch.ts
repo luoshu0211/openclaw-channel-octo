@@ -1066,7 +1066,9 @@ export async function ackBotEvent(params: {
     // An ack runs inside the poll loop's sequential drain and its failure is only
     // logged — it never becomes a poll outcome, so nothing downstream would pace a
     // retry. Sleeping here would just stall the events queued behind this one, and the
-    // cursor is persisted before the ack, so a lost ack costs at most one redelivery.
+    // callers normally persist the cursor before the ack, so a lost ack costs at
+    // most one redelivery. During a deliberately blocked cursor gap, the poller
+    // only ACKs recognized handlers that carry their own event-level idempotency.
     { retryOn429: false },
   );
 }

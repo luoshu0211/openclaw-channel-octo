@@ -14,6 +14,8 @@ import { CHANNEL_ID } from "./constants.js";
 import { parseCardAction, type CardAction } from "./card-action.js";
 import { invalidateBotCardProfile } from "./card-profile-cache.js";
 import { parseDocCommentMention, type DocCommentMention } from "./doc-mention.js";
+import { parseBotTaskResult, type BotTask } from "./bot-task.js";
+import { RetryableBotTaskError } from "./bot-task-handler.js";
 
 const DEFAULT_INTERVAL_MS = 2_000;
 const DEFAULT_LIMIT = 50;
@@ -68,6 +70,8 @@ export interface EventPollerOptions {
   onCardAction?: (action: CardAction) => void | Promise<void>;
   /** 文档评论 @Bot 任务(octo-server `doc_comment_mention`)。未提供则该类事件不被识别。 */
   onDocMention?: (mention: DocCommentMention) => void | Promise<void>;
+  /** Generic business task. The handler owns retry/dead-letter policy and throws only to retry. */
+  onBotTask?: (task: BotTask) => void | Promise<void>;
   intervalMs?: number;
   limit?: number;
   /**
@@ -184,8 +188,9 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
    * So: only a hold that was genuinely honoured earns an immediate re-poll.
    */
   const nextDelayMs = (
-    outcome: "batch" | "empty" | "error",
+    outcome: "batch" | "empty" | "error" | "bot_task_retry",
     requestMs: number,
+    botTaskAttempt = 1,
   ): number => {
     if (outcome === "error") {
       // Never hammer an unhealthy server. Exponential, capped, reset on any success.
@@ -204,6 +209,12 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
       return Math.min(MAX_ERROR_BACKOFF_MS, intervalMs * 2 ** (consecutiveErrors - 1));
     }
     consecutiveErrors = 0;
+    if (outcome === "bot_task_retry") {
+      return Math.min(
+        MAX_ERROR_BACKOFF_MS,
+        intervalMs * 2 ** Math.max(0, botTaskAttempt - 1),
+      );
+    }
     if (waitSeconds === 0) return intervalMs; // short poll: success pacing unchanged
     // Events in hand: drain immediately, there may be more behind them.
     if (outcome === "batch") return 0;
@@ -218,7 +229,8 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
   const tick = async (): Promise<void> => {
     if (stopped) return;
     const startedAt = Date.now();
-    let outcome: "batch" | "empty" | "error" = "empty";
+    let outcome: "batch" | "empty" | "error" | "bot_task_retry" = "empty";
+    let botTaskRetryAttempt = 1;
     try {
       const controller = new AbortController();
       inFlight = controller;
@@ -242,13 +254,19 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
       }
       let cardActions = 0;
       let docMentions = 0;
+      let botTasks = 0;
       const ordered = events
         .filter((event) => Number.isSafeInteger(event.event_id) && event.event_id > cursor)
         .sort((a, b) => a.event_id - b.event_id);
+      // A retryable Bot Task leaves a cursor gap. Later events may still be
+      // handled and ACKed, but the durable/in-memory cursor must not advance
+      // past that gap or the failed task would be skipped forever.
+      let cursorBlocked = false;
       for (const event of ordered) {
         // 已识别的事件才 ack。未识别的只推进游标(本消费者不再重复拉取),
         // 留在服务端直至过期 —— 不 ack 自己没处理的事件。
         let recognized = false;
+        let retryBotTask = false;
         const action = options.onCardAction ? parseCardAction(event) : null;
         if (action) {
           recognized = true;
@@ -276,13 +294,52 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
             }
           }
         }
+        if (!recognized && event.event_type === "bot_task" && options.onBotTask) {
+          // A bot_task is recognized by its fixed envelope type even when its payload is
+          // malformed. Invalid payloads are poison messages: log and ACK so they cannot block
+          // the account forever. A valid handler throws only for retryable execution failures.
+          recognized = true;
+          let parsed: ReturnType<typeof parseBotTaskResult>;
+          try {
+            parsed = parseBotTaskResult(event);
+          } catch (error) {
+            // Defense in depth: parsers operate on an untrusted server payload.
+            // A poison event must be ACKed even if a future parser regression
+            // throws instead of returning an invalid result.
+            parsed = {
+              ok: false,
+              reason: `parser threw: ${error instanceof Error ? error.message : String(error)}`,
+            };
+          }
+          if (!parsed.ok) {
+            options.log?.error?.(
+              `octo: invalid bot_task event ${event.event_id}, dropped and acknowledged: ${parsed.reason}`,
+            );
+          } else {
+            botTasks += 1;
+            try {
+              await options.onBotTask(parsed.task);
+            } catch (error) {
+              retryBotTask = true;
+              cursorBlocked = true;
+              if (error instanceof RetryableBotTaskError) {
+                botTaskRetryAttempt = Math.max(botTaskRetryAttempt, error.attemptCount);
+              }
+              options.log?.error?.(
+                `octo: bot task handler will retry event ${event.event_id}: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+          }
+        }
         if (event.event_type === "bot_setting_updated" &&
             event.event_data?.scope === "bot_setting") {
           invalidateBotCardProfile({ apiUrl: options.apiUrl, botToken: options.botToken });
         }
 
-        // 落盘游标**排在 ack 之前**(保留 main 的不变量):进程崩溃最坏是重放一次动作,
-        // 绝不会 ack 掉一个本地已经忘掉的事件。
+        // 没有重试缺口时,落盘游标**排在 ack 之前**:进程崩溃最坏是重放一次动作。
+        // 若前面的 Bot Task 留下缺口,后续已识别事件仍会处理并 ACK,但不越过缺口推进
+        // cursor；此路径依赖各 handler 自身的事件级幂等(card claim、doc dedupe、Bot
+        // Task state store，setting update 则是纯缓存失效)来安全承受下轮重取。
         //
         // 但落盘**不许抛**(本 PR 补的第二个不变量):游标文件(events.cursor.json)和文档
         // 任务的去重表(doc-mentions.processed.json)在**同一个状态目录**,EROFS / ENOSPC /
@@ -290,20 +347,22 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
         // 不 ack、游标不前进、批次剩下的事件也一起不处理 —— 下一 tick 原样重取,把会改文档
         // 的任务每周期重跑一遍(实测 polls=6 taskRuns=6,3.2s 内 6 遍,永不收敛),同时把
         // 卡片动作一并楔死。所以:记日志、内存游标照常前进、ack 与批次余项照常执行。
-        try {
-          await options.cursorStore.save(event.event_id);
-        } catch (error) {
-          options.log?.error?.(
-            `octo: cursor save failed at event ${event.event_id} (in-memory cursor still advances): ${error instanceof Error ? error.message : String(error)}`,
-          );
+        if (!cursorBlocked) {
+          try {
+            await options.cursorStore.save(event.event_id);
+          } catch (error) {
+            options.log?.error?.(
+              `octo: cursor save failed at event ${event.event_id} (in-memory cursor still advances): ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          // 内存游标无条件前进:落盘失败只影响重启后的起点,不该让本进程反复重取。
+          // 重启后若因旧 cursor 再取到文档事件,持久去重表负责收敛。
+          cursor = event.event_id;
         }
-        // 内存游标无条件前进:落盘失败只影响重启后的起点,不该让本进程反复重取。
-        // 重启后若因旧 cursor 再取到文档事件,持久去重表负责收敛。
-        cursor = event.event_id;
 
         // 只 ack 自己识别并处理过的事件。未识别的只推进游标(本消费者不再重复拉取),
         // 留在服务端直至过期。
-        if (recognized && options.ack !== false) {
+        if (recognized && !retryBotTask && options.ack !== false) {
           try {
             await ackBotEvent({
               apiUrl: options.apiUrl,
@@ -325,10 +384,10 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
       // at 0ms, and re-issue the identical request forever. Reproduced at ~430 req/s before
       // this line was corrected; it falls through to "empty" and is paced by intervalMs now,
       // which is the right treatment for a server that is not making progress for us.
-      outcome = ordered.length > 0 ? "batch" : "empty";
+      outcome = cursorBlocked ? "bot_task_retry" : ordered.length > 0 ? "batch" : "empty";
       if (events.length > 0) {
         options.log?.info?.(
-          `octo: event poll batch events=${events.length} card_actions=${cardActions} doc_mentions=${docMentions} cursor=${cursor}`,
+          `octo: event poll batch events=${events.length} card_actions=${cardActions} doc_mentions=${docMentions} bot_tasks=${botTasks} cursor=${cursor}`,
         );
       }
     } catch (error) {
@@ -342,7 +401,7 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
       }
     } finally {
       inFlight = undefined;
-      schedule(nextDelayMs(outcome, Date.now() - startedAt));
+      schedule(nextDelayMs(outcome, Date.now() - startedAt, botTaskRetryAttempt));
     }
   };
 

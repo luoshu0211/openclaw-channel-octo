@@ -41,6 +41,7 @@ export interface OctoAccountConfig {
   /** @deprecated Ignored; the server's per-Bot interaction_enabled is authoritative. */
   cardInteraction?: boolean;
   docTasks?: boolean;  // Document comment @Bot tasks. Default on; boolean false opts out.
+  botTasks?: boolean;  // Generic server-issued Bot Tasks. Default on; boolean false opts out.
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret: secret files may only be written under this path. When unset, defaults to the agent's workspace (agents.list[].workspace matched to the agent, else agents.defaults.workspace); if neither resolves, write-secret fails closed (no process.cwd() fallback).
   dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms). Unset = derived from agents.defaults.timeoutSeconds + 60s buffer (issue #113).
@@ -70,6 +71,7 @@ export interface OctoConfig {
   /** @deprecated Ignored; the server's per-Bot interaction_enabled is authoritative. */
   cardInteraction?: boolean;
   docTasks?: boolean;  // Top-level default for document comment @Bot tasks
+  botTasks?: boolean;  // Top-level default for generic Bot Tasks
   onBehalfOf?: string;  // Persona clone: grantor uid — bot acts on behalf of this human
   secretsFileRoot?: string;  // Jail root for write-secret (see OctoAccountConfig)
   dispatchTimeoutMs?: number;  // Explicit per-inbound dispatch timeout override (ms); see OctoAccountConfig
@@ -100,10 +102,13 @@ export const EVENT_WAIT_SECONDS_DESCRIPTION =
   "Seconds to let the server hold an empty /v1/bot/events queue open (its `wait` parameter), so a card action reaches the bot as soon as it happens instead of on the next poll tick. Omitted or 0 keeps plain short polling at pollIntervalMs; a non-zero value below 5 is raised to 5, because shorter holds issue more requests than the short polling they replace. Requires a server that supports the long poll; older servers ignore the field and answer immediately, which is safe but gives no benefit. The client request timeout is derived from this value, and the server clamps it to 30s. Per-account values override the top-level value.";
 // main 删除了 CARD_PROGRESS / CARD_DISPLAY / CARD_INTERACTION / REASONING_CARD_TEMPLATE_MODE 这些
 // description 常量与 schema 片段(服务端 per-Bot 配置权威,本地字段仅保留为 @deprecated 兼容项),
-// 本 PR 不恢复它们。下面只保留本 PR 真正新增的两个 key 的描述。
+// 本 PR 不恢复它们。下面只保留当前功能实际使用的配置描述。
 
 export const DOC_TASKS_DESCRIPTION =
-  "Document comment @Bot tasks: keeps the bot event poller resident and routes task replies to the doc comment thread instead of IM. Enabled by default; set false to run the account as a plain IM bot.";
+  "Document comment @Bot tasks: routes task replies to the doc comment thread instead of IM. Enabled by default; false disables document tasks only. Event polling may remain active for generic Bot Tasks or interactive cards.";
+
+export const BOT_TASKS_DESCRIPTION =
+  "Generic server-issued Bot Tasks: runs the supplied business prompt in an isolated agent turn and requires business output through octo-cli. Enabled by default; set false to disable generic task execution. Set both botTasks and docTasks to false when the account should not run background tasks.";
 
 // Shared description for docsApiUrl, kept identical to the wording in
 // openclaw.plugin.json (manifest-schema-sync.test.ts asserts key-level sync).
@@ -179,6 +184,7 @@ export const OctoConfigJsonSchema = {
       historyLimit: { type: "number", minimum: 1, maximum: 100 },
       historyPromptTemplate: { type: "string" },
       docTasks: { type: "boolean", default: true, description: DOC_TASKS_DESCRIPTION },
+      botTasks: { type: "boolean", default: true, description: BOT_TASKS_DESCRIPTION },
       onBehalfOf: { type: "string" },
       secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
       dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },
@@ -203,6 +209,7 @@ export const OctoConfigJsonSchema = {
             historyLimit: { type: "number", minimum: 1, maximum: 100 },
             historyPromptTemplate: { type: "string" },
             docTasks: { type: "boolean", default: true, description: DOC_TASKS_DESCRIPTION },
+            botTasks: { type: "boolean", default: true, description: BOT_TASKS_DESCRIPTION },
             onBehalfOf: { type: "string" },
             secretsFileRoot: { type: "string", description: SECRETS_FILE_ROOT_DESCRIPTION },
             dispatchTimeoutMs: { type: "number", minimum: 1000, description: DISPATCH_TIMEOUT_MS_DESCRIPTION },

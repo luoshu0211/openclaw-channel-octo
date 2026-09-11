@@ -115,3 +115,15 @@ export class OctoApiError extends Error {
     });
   }
 }
+
+/** A successful HTTP status that violates an endpoint's delivery contract. */
+export class OctoApiStatusMismatchError extends OctoApiError {
+  readonly expectedStatus: number;
+
+  constructor(path: string, status: number, expectedStatus: number) {
+    // Do not include the response body in this protocol diagnostic.
+    super({ path, status, body: `expected ${expectedStatus}`, retryAfterMs: 0 });
+    this.name = "OctoApiStatusMismatchError";
+    this.expectedStatus = expectedStatus;
+  }
+}

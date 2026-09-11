@@ -353,12 +353,9 @@ describe("parseDocCommentMention — doc_kind", () => {
     }
   });
 
-  it("未知类型当作普通文档,不原样带过去", () => {
-    // ★ 认下一个自己还不支持的类型,会让插件去调一套没实现的 API;当普通文档处理
-    // 至少会拿到 docs-backend 一个明确的报错。未知值往安全的一侧倒。
-    for (const raw of ["sheet", "html_ppt", "htm", ""]) {
-      expect(parseDocCommentMention(event({ doc_kind: raw }))!.docKind).toBeUndefined();
-    }
+  it("拒绝未知文档类型,空值保留旧文档行为", () => {
+    for (const raw of ["sheet", "html_ppt", "htm"]) expect(parseDocCommentMention(event({ doc_kind: raw }))).toBeNull();
+    expect(parseDocCommentMention(event({doc_kind: ""}))!.docKind).toBeUndefined();
   });
 
   it("非字符串类型不会让整条任务被丢弃", () => {

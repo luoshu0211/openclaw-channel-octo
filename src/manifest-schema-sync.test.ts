@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { BOT_TASKS_DESCRIPTION, DOC_TASKS_DESCRIPTION, DOCS_API_URL_DESCRIPTION, OctoConfigJsonSchema } from "./config-schema.js";
+import { DOCS_CLI_PATH_DESCRIPTION, BOT_TASKS_DESCRIPTION, DOC_TASKS_DESCRIPTION, DOCS_API_URL_DESCRIPTION, OctoConfigJsonSchema } from "./config-schema.js";
 
 // Regression guard for OpenClaw v2026.5.x channel manifest requirement:
 // openclaw.plugin.json#channelConfigs.octo.schema must stay in sync
@@ -54,6 +54,7 @@ describe("openclaw.plugin.json channelConfigs", () => {
     ["docTasks", DOC_TASKS_DESCRIPTION],
     ["botTasks", BOT_TASKS_DESCRIPTION],
     ["docsApiUrl", DOCS_API_URL_DESCRIPTION],
+    ["docsCliPath", DOCS_CLI_PATH_DESCRIPTION],
   ])("%s description matches at top-level and per-account", (key, expected) => {
     const manifestProps = manifest.channelConfigs.octo.schema.properties;
     const manifestAccountProps = manifestProps.accounts.additionalProperties.properties;

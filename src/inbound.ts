@@ -1621,12 +1621,19 @@ export async function handleInboundMessage(params: {
     reportTurn: (report: DocTaskTurnReport) => void;
     /** 仅 Bot Task 开启，超时时中止底层 Agent。 */
     abortOnTimeout?: boolean;
+    /** Absolute PPT task deadline; retries and continuation must not reset it. */
+    deadlineAt?: number;
+    /** Account shutdown must cancel an already-running PPT agent. */
+    signal?: AbortSignal;
     /** 将回合交给 Agent runtime 前调用。 */
     onAgentTurnStarted?: () => void | Promise<void>;
+      /** Roll back the reservation only when runtime was never called. */
+      onAgentTurnNotStarted?: () => void | Promise<void>;
   };
 }) {
   const { account, message, botUid, groupHistories, lastBotReplySeqMap, memberMap, uidToNameMap, groupCacheTimestamps, groupMdCache, log, statusSink } = params;
   const docTask = params.docTask;
+  const dispatchAbortController = docTask?.abortOnTimeout || docTask?.signal ? new AbortController() : undefined;
   // Server-authoritative robot map. Default to a throwaway Map when the caller
   // omits it so the gate logic below can read it unconditionally; the real
   // channel call site passes a persistent per-account map.
@@ -3005,7 +3012,10 @@ export async function handleInboundMessage(params: {
       // 不需要猜,透传即可。
       const replyIntent: DocReplyIntent =
         intent.type === "notice" ? "notice" : claimsFinal ? "final" : "progress";
-      await docTask.postComment(body, signal, replyIntent);
+      const postSignals = [signal, docTask.signal, dispatchAbortController?.signal].filter((value): value is AbortSignal => !!value);
+      const postSignal = postSignals.length ? AbortSignal.any(postSignals) : undefined;
+      if (postSignal?.aborted) throw postSignal.reason;
+      await docTask.postComment(body, postSignal, replyIntent);
       docTaskDelivered = true;
       if (intent.type === "notice") {
         docTaskNoticed = true;
@@ -3348,23 +3358,40 @@ export async function handleInboundMessage(params: {
   // protects against a same-text upstream error being misclassified.
   let dispatchTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
   const dispatchTimeoutMs = resolveDispatchTimeoutMs(config, account);
-  const timeoutError = new Error(
-    `octo: dispatch timed out after ${dispatchTimeoutMs}ms`,
-  );
+  let remainingDispatchMs = dispatchTimeoutMs;
+  const timeoutError = new Error("octo: dispatch timed out (shared budget expired)");
+  const stoppedError = new Error("octo: account stopped during dispatch");
+  let removeStopListener: (() => void) | undefined;
   const abortTimedOutDispatch = docTask?.abortOnTimeout === true;
-  const dispatchAbortController = abortTimedOutDispatch ? new AbortController() : undefined;
+  let handoffRecorded = false;
+  let runtimeHandedOff = false;
   let dispatchTimeoutPromise: Promise<never> | undefined;
   let dispatchPromise: Promise<unknown> | undefined;
   try {
     // Persist the at-most-once boundary before invoking the runtime. The
     // dispatch timeout starts afterwards so a slow state store cannot produce
     // an unhandled timer rejection while this callback is still pending.
+    if (docTask?.signal?.aborted) throw stoppedError;
+    if (docTask?.deadlineAt !== undefined && Date.now() >= docTask.deadlineAt) throw timeoutError;
     await docTask?.onAgentTurnStarted?.();
+    handoffRecorded = true;
+    if (docTask?.signal?.aborted) throw stoppedError;
+    remainingDispatchMs = typeof docTask?.deadlineAt === "number" && Number.isFinite(docTask.deadlineAt)
+      ? Math.min(dispatchTimeoutMs, docTask.deadlineAt - Date.now())
+      : dispatchTimeoutMs;
+    timeoutError.message = `octo: dispatch timed out after ${Math.max(0, remainingDispatchMs)}ms`;
+    if (remainingDispatchMs <= 0) throw timeoutError;
     dispatchTimeoutPromise = new Promise<never>((_, reject) => {
+      const onStop = () => {
+        reject(stoppedError);
+        dispatchAbortController?.abort(stoppedError);
+      };
+      docTask?.signal?.addEventListener("abort", onStop, { once: true });
+      removeStopListener = () => docTask?.signal?.removeEventListener("abort", onStop);
       dispatchTimeoutHandle = setTimeout(() => {
         reject(timeoutError);
         dispatchAbortController?.abort(timeoutError);
-      }, dispatchTimeoutMs);
+      }, remainingDispatchMs);
     });
     dispatchPromise = core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
@@ -3406,6 +3433,7 @@ export async function handleInboundMessage(params: {
       // this callback did not consume, so the property is not load-bearing.
       dispatcherOptions: ({
         deliver: async (payload: ReplyPayload, info: { kind: ReplyDispatchKind }) => {
+          if (dispatchAbortController?.signal.aborted) return;
           // Reasoning is not a normal chat reply. Capture its user-visible lane for the
           // progress card as a compatibility fallback for hosts that deliver reasoning
           // payloads through the dispatcher instead of onReasoningStream.
@@ -3647,24 +3675,29 @@ export async function handleInboundMessage(params: {
         onFreshSettledDelivery?: () => Promise<{ visibleReplySent: boolean } | undefined>;
       }),
     });
+    runtimeHandedOff = true;
     await Promise.race([dispatchPromise, dispatchTimeoutPromise]);
   } catch (err) {
+    if (handoffRecorded && !runtimeHandedOff) {
+      try { await docTask?.onAgentTurnNotStarted?.(); }
+      catch { log?.error?.("octo: failed to roll back unstarted task reservation; automatic replay remains disabled"); }
+    }
     // Timeout: dispatch never returned within dispatchTimeoutMs. Tell the
     // user, suppress any stale buffered text (so the finally-flush branch
     // does not double-send), then rethrow so the per-group queue's outer
     // .catch() (channel.ts#enqueueInbound) can advance to the next message
     // — otherwise this group stays stuck forever, see issue #75.
     //
-    if (err === timeoutError) {
+    if (err === timeoutError || err === stoppedError || docTask?.signal?.aborted) {
       // Emit the primary diagnostic before waiting for cooperative shutdown;
       // otherwise an abort-ignoring host makes the timeout itself invisible.
       log?.warn?.(
-        `octo: dispatch hung past ${dispatchTimeoutMs}ms, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
+        `octo: ${docTask?.signal?.aborted || err === stoppedError ? "account stopped" : `dispatch hung past ${remainingDispatchMs}ms`}, aborting to unblock per-group queue (session=${route?.sessionKey ?? "?"})`,
       );
       // Give Bot Tasks a bounded chance to honour abortSignal. If a run ignores
       // cancellation, release the queue anyway. The handler already knows the
       // Agent started and will dead-letter rather than replay this event.
-      if (abortTimedOutDispatch && dispatchPromise) {
+      if (dispatchAbortController && dispatchPromise) {
         let abortGraceHandle: ReturnType<typeof setTimeout> | undefined;
         const abortOutcome = await Promise.race([
           dispatchPromise.then(
@@ -3699,6 +3732,7 @@ export async function handleInboundMessage(params: {
       if (userFacingFinalDelivered) {
         log?.info?.("octo: dispatch timed out after a final answer already landed — suppressing the timeout notice");
       } else if (abortTimedOutDispatch) {
+        // Aborted Bot/PPT tasks use their owning handler for fallback delivery.
         // Generic Bot Tasks have no channel destination: their business reply
         // (when required) goes through the source-specific CLI. Keep this
         // synthetic timeout notice as operator telemetry instead of trying to
@@ -3779,6 +3813,7 @@ export async function handleInboundMessage(params: {
     throw err;
   } finally {
     if (dispatchTimeoutHandle) clearTimeout(dispatchTimeoutHandle);
+    removeStopListener?.();
     // --- Debug: log dispatch outcome ---
     log?.debug?.(`octo: [dispatch-result] replySucceeded=${replySucceeded} bufferedText=${deliverBuffer.lastText?.length ?? 0} textSent=${deliverBuffer.textSent} userFacingFinalDelivered=${userFacingFinalDelivered} effectiveOBO=${effectiveOnBehalfOf ?? 'none'}`);
 

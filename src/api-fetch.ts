@@ -4,7 +4,7 @@
  */
 
 import { ChannelType, MessageType, CARD_INTERACTIVE_PROFILE, CARD_PROFILE, CARD_VERSION, type CardProfile, type MentionEntity, type RichTextBlock, type SendMessageResult, type TargetCandidate } from "./types.js";
-import { OctoApiError } from "./api-error.js";
+import { OctoApiError, OctoApiStatusMismatchError } from "./api-error.js";
 import path from "path";
 import { open } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -188,16 +188,54 @@ function backoffSleep(ms: number, signal: AbortSignal | undefined, cause: unknow
   });
 }
 
-export async function postJson<T>(
+interface JsonRequestOptions {
+  retryOn429?: boolean;
+  idempotencyKey?: string;
+  expectedStatus?: number;
+  redirect?: RequestRedirect;
+  /** Optional decoded response cap for callers that fetch large documents. */
+  maxResponseBytes?: number;
+}
+
+async function readResponseText(response: Response, maxBytes?: number): Promise<string> {
+  if (maxBytes === undefined) return response.text();
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  let bytes = 0;
+  const chunks: Buffer[] = [];
+  try {
+    // Content-Length can understate a compressed or chunked response, so the
+    // decoded stream remains authoritative even after this early rejection.
+    if (Number(response.headers.get("content-length")) > maxBytes) {
+      throw new Error("Octo API response exceeds byte limit");
+    }
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) throw new Error("Octo API response exceeds byte limit");
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, bytes).toString("utf8");
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function requestJson<T>(
   apiUrl: string,
   botToken: string,
   path: string,
-  payload: Record<string, unknown>,
+  method: "GET" | "POST",
+  payload: Record<string, unknown> | undefined,
   signal?: AbortSignal,
-  opts?: { retryOn429?: boolean },
+  opts: JsonRequestOptions = {},
 ): Promise<T | undefined> {
   const url = `${apiUrl.replace(/\/+$/, "")}${path}`;
-  const retryOn429 = opts?.retryOn429 ?? true;
+  const retryOn429 = opts.retryOn429 ?? true;
   let waited = 0;
 
   for (let attempt = 0; ; attempt++) {
@@ -210,17 +248,22 @@ export async function postJson<T>(
       : AbortSignal.timeout(DEFAULT_POST_TIMEOUT_MS);
 
     const response = await fetch(url, {
-      method: "POST",
+      method,
       headers: {
-        ...DEFAULT_HEADERS,
+        ...(payload ? DEFAULT_HEADERS : {}),
         Authorization: `Bearer ${botToken}`,
+        ...(opts.idempotencyKey ? { "Idempotency-Key": opts.idempotencyKey } : {}),
       },
-      body: JSON.stringify(payload),
+      ...(payload ? { body: JSON.stringify(payload) } : {}),
       signal: fetchSignal,
+      ...(opts.redirect ? { redirect: opts.redirect } : {}),
     });
 
     if (response.ok) {
-      const text = await response.text();
+      if (opts.expectedStatus !== undefined && response.status !== opts.expectedStatus) {
+        throw new OctoApiStatusMismatchError(path, response.status, opts.expectedStatus);
+      }
+      const text = await readResponseText(response, opts.maxResponseBytes);
       if (!text) return undefined;
       try {
         return parseOctoJson<T>(text);
@@ -229,7 +272,7 @@ export async function postJson<T>(
       }
     }
 
-    const body = await response.text().catch(() => "");
+    const body = await readResponseText(response, opts.maxResponseBytes).catch(() => "");
     const err = OctoApiError.from(response, path, body);
 
     if (!err.isRateLimited) throw err;
@@ -256,6 +299,27 @@ export async function postJson<T>(
     await backoffSleep(delay, signal, err);
     waited += delay;
   }
+}
+
+export async function postJson<T>(
+  apiUrl: string,
+  botToken: string,
+  path: string,
+  payload: Record<string, unknown>,
+  signal?: AbortSignal,
+  opts?: JsonRequestOptions,
+): Promise<T | undefined> {
+  return requestJson(apiUrl, botToken, path, "POST", payload, signal, opts);
+}
+
+export async function getJson<T>(
+  apiUrl: string,
+  botToken: string,
+  path: string,
+  signal?: AbortSignal,
+  opts?: JsonRequestOptions,
+): Promise<T | undefined> {
+  return requestJson(apiUrl, botToken, path, "GET", undefined, signal, opts);
 }
 
 
@@ -1135,7 +1199,7 @@ export class DocCommentRejectedError extends Error {
  * 「稍后再来」的语义。其余(网络、5xx、超时)都值得重试。
  */
 export function isPermanentDocCommentFailure(err: unknown): boolean {
-  if (err instanceof DocCommentRejectedError) return true;
+  if (err instanceof DocCommentRejectedError || err instanceof OctoApiStatusMismatchError) return true;
   const status = httpStatusFromApiFetchError(err);
   if (status === undefined) return false;
   // 408 请求超时 / 423 资源被锁(文档正被并发编辑)/ 425 太早 / 429 限流 —— 这四个

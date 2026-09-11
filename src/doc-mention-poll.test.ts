@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createMemoryDocTaskDeadLetterStore } from "./doc-task-deadletter.js";
 import { startEventPoller, type EventCursorStore } from "./events-poll.js";
 import { createFileDocMentionDedupeStore, createMemoryDocMentionDedupeStore } from "./doc-mention-dedupe.js";
 import type { DocCommentMention } from "./doc-mention.js";
@@ -65,6 +66,7 @@ afterEach(() => {
 });
 
 describe("轮询器识别文档任务事件", () => {
+
   it("解析并派发 doc_comment_mention,且完成后 ack", async () => {
     const { acked } = installFetch([docEvent(11)]);
     const seen: DocCommentMention[] = [];
@@ -295,6 +297,31 @@ describe("轮询器识别文档任务事件", () => {
     expect(seen).toEqual([]);
     expect(acked).toEqual([]);
   });
+
+  it("records unknown document kinds without replaying later supported events", async () => {
+    const { acked } = installFetch([docEvent(32, { doc_kind: "future_deck" }), docEvent(33, { doc_kind: "ppt" })]);
+    const cursorStore = memoryCursor(31);
+    const errors: string[] = [];
+    const handler = vi.fn();
+    const poller = startEventPoller({
+      apiUrl: API,
+      botToken: "tok",
+      intervalMs: 500,
+      cursorStore,
+      onDocMention: handler,
+      log: { error: (message) => errors.push(message) },
+    });
+    await poller.ready;
+    await drain();
+    poller.stop();
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(handler.mock.calls[0][0].eventId).toBe(33);
+    expect(poller.cursor()).toBe(33);
+    expect(await cursorStore.load()).toBe(33);
+    expect(acked).toEqual([33]);
+    expect(errors).toContain('octo: unsupported doc_kind for event 32: "future_deck"; recorded for operator recovery without dispatch or ACK');
+  });
 });
 
 describe("文档任务持久去重", () => {
@@ -397,4 +424,117 @@ describe("文档任务持久去重", () => {
     store.release("a");
     expect(await store.claim("c")).toBe(true);
   });
+});
+
+it('quarantines unknown kinds and persists progress even when ACK fails', async () => {
+  vi.useFakeTimers();
+  const cursorStore = memoryCursor();
+  const deadLetter = createMemoryDocTaskDeadLetterStore();
+  const events = [docEvent(1, { doc_kind: 'future_deck' }), docEvent(2, { doc_kind: 'ppt' }), docEvent(3, { doc_kind: 'ppt' })];
+  const seen:number[]=[];
+  globalThis.fetch = vi.fn(async (input:any, init?:RequestInit) => {
+    if (/\/ack$/.test(String(input))) return new Response('unavailable',{status:503});
+    const since=Number(JSON.parse(String(init?.body)).event_id??0);
+    return new Response(JSON.stringify({status:1,results:events.filter(e=>e.event_id>since).slice(0,2)}));
+  }) as typeof fetch;
+  let poller:ReturnType<typeof startEventPoller>|undefined;
+  try {
+    const options={apiUrl:API,botToken:'tok',intervalMs:500,limit:2,cursorStore,docTaskDeadLetter:deadLetter,onDocMention:async(m:DocCommentMention)=>{seen.push(m.eventId);}};
+    poller=startEventPoller(options);await poller.ready;
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(seen).toEqual([2,3]);expect(await cursorStore.load()).toBe(3);
+    expect(await deadLetter.list()).toMatchObject([{reason:'unsupported_doc_kind',docId:'d1',threadId:'70'}]);
+    poller.stop();poller=startEventPoller(options);await poller.ready;await vi.advanceTimersByTimeAsync(1000);
+    expect(seen).toEqual([2,3]);expect(await deadLetter.list()).toHaveLength(1);
+  } finally {poller?.stop();vi.useRealTimers();}
+});
+
+it('does not ACK a PPT event when account stops before the handler returns',async()=>{
+ vi.useFakeTimers();
+ const {acked}=installFetch([docEvent(71,{doc_kind:'ppt'})]);
+ const cursor=memoryCursor(70);
+ const poller=startEventPoller({apiUrl:API,botToken:'tok',intervalMs:500,cursorStore:cursor,onDocMention:async()=>{poller.stop();}});
+ try {
+  await poller.ready;await vi.advanceTimersByTimeAsync(500);
+  expect(acked).toEqual([]);expect(cursor.saved).toEqual([]);expect(poller.cursor()).toBe(70);
+ } finally {poller.stop();vi.useRealTimers();}
+});
+
+it('scans a full page even when one event has a malformed id', async () => {
+ vi.useFakeTimers();
+ const seen:number[]=[];const requested:number[]=[];
+ globalThis.fetch=vi.fn(async(input:any,init?:RequestInit)=>{
+  if (/\/ack$/.test(String(input))) return new Response('{"status":1}');
+  const since=Number(JSON.parse(String(init?.body)).event_id??0);requested.push(since);
+  const results=since===0?[docEvent(1,{doc_kind:'future_deck'}),{...docEvent(2),event_id:'bad'}]:[docEvent(3,{doc_kind:'ppt'})];
+  return new Response(JSON.stringify({status:1,results}));
+ }) as typeof fetch;
+ const poller=startEventPoller({apiUrl:API,botToken:'tok',intervalMs:500,limit:2,cursorStore:memoryCursor(),onDocMention:async m=>{seen.push(m.eventId);}});
+ try {
+  await poller.ready;await vi.advanceTimersByTimeAsync(1000);
+  expect(requested).toEqual([0,1]);expect(seen).toEqual([3]);expect(poller.cursor()).toBe(3);
+ } finally {poller.stop();vi.useRealTimers();}
+});
+
+it.each([
+  { kind: undefined, throws: false },
+  { kind: undefined, throws: true },
+  { kind: 'html', throws: false },
+  { kind: 'html', throws: true },
+])('finishes legacy/HTML receipt on stop without replay ($kind, throws=$throws)', async ({ kind, throws }) => {
+  vi.useFakeTimers();
+  const cursorStore = memoryCursor(70);
+  const events = [docEvent(71, { doc_kind: kind }), docEvent(72, { doc_kind: kind })];
+  const acked: number[] = [], seen: number[] = [];
+  globalThis.fetch = vi.fn(async (input: any, init?: RequestInit) => {
+    const ack = /\/events\/(\d+)\/ack$/.exec(String(input));
+    if (ack) { acked.push(Number(ack[1])); return new Response('{"status":1}'); }
+    const since = Number(JSON.parse(String(init?.body)).event_id ?? 0);
+    return new Response(JSON.stringify({ status: 1, results: events.filter(e => e.event_id > since) }));
+  }) as typeof fetch;
+  let poller: ReturnType<typeof startEventPoller>;
+  let firstRun = true;
+  const options = { apiUrl: API, botToken: 'tok', intervalMs: 500, cursorStore,
+    onDocMention: async (m: DocCommentMention) => {
+      seen.push(m.eventId);
+      if (firstRun) {
+        poller.stop();
+        if (throws) throw new Error('stopped after document side effect');
+      }
+    },
+  };
+  poller = startEventPoller(options);
+  try {
+    await poller.ready; await vi.advanceTimersByTimeAsync(500);
+    expect(seen).toEqual([71]); expect(acked).toEqual([71]);
+    expect(cursorStore.saved).toEqual([71]);
+    firstRun = false;
+    poller = startEventPoller(options);
+    await poller.ready; await vi.advanceTimersByTimeAsync(1000);
+    expect(seen).toEqual([71, 72]); expect(acked).toEqual([71, 72]);
+  } finally { poller.stop(); vi.useRealTimers(); }
+});
+
+it('persists an unknown-kind dead letter once when its recorder stops the poller', async () => {
+  vi.useFakeTimers();
+  const cursorStore = memoryCursor(70);
+  const store = createMemoryDocTaskDeadLetterStore();
+  const { acked } = installFetch([docEvent(71, { doc_kind: 'future_deck' })]);
+  const dispatch = vi.fn();
+  let poller: ReturnType<typeof startEventPoller>;
+  const options = { apiUrl: API, botToken: 'tok', intervalMs: 500, cursorStore,
+    onDocMention: dispatch,
+    docTaskDeadLetter: { list: store.list, record: async (entry: Parameters<typeof store.record>[0]) => {
+      await store.record(entry); poller.stop();
+    } },
+  };
+  poller = startEventPoller(options);
+  try {
+    await poller.ready; await vi.advanceTimersByTimeAsync(500);
+    expect(cursorStore.saved).toEqual([71]); expect(acked).toEqual([]);
+    installFetch([docEvent(71, { doc_kind: 'future_deck' })]);
+    poller = startEventPoller(options);
+    await poller.ready; await vi.advanceTimersByTimeAsync(500);
+    expect(await store.list()).toHaveLength(1); expect(dispatch).not.toHaveBeenCalled();
+  } finally { poller.stop(); vi.useRealTimers(); }
 });

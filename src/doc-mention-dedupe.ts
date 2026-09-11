@@ -26,6 +26,8 @@ export interface DocMentionDedupeStore {
   claim(idempotencyKey: string): Promise<boolean>;
   /** 任务成功收尾:写入磁盘,此后跨进程去重。 */
   complete(idempotencyKey: string): Promise<void>;
+  /** Undo a persisted PPT handoff only when runtime was never invoked. */
+  forgetUnstarted?(idempotencyKey: string): Promise<void>;
   /** 任务未完成:撤销「进行中」标记,允许后续重投再次执行。 */
   release(idempotencyKey: string): void;
 }
@@ -48,6 +50,7 @@ export function createFileDocMentionDedupeStore(params: {
   let loaded: Promise<string[]> | undefined;
   let cache: string[] | undefined;
   const inFlight = new Set<string>();
+  const evictedByReservation = new Map<string, string[]>();
   // 串行化写入,避免同账号并发任务互相覆盖(rename 是原子的,但读-改-写不是)。
   // 注意:仅限**单进程内**。同账号多进程各持一份内存快照,整表读-改-写后
   // last-writer-wins 会丢 key;当前部署形态是每进程一个常驻轮询器,故可接受。
@@ -114,13 +117,34 @@ export function createFileDocMentionDedupeStore(params: {
         // 一次重放。但那个窗口比这条不变量保护的场景窄得多,而这条不变量有专门的
         // 测试钉着,是当初为一个真实缺陷加的。不为一条 P2 建议翻掉它。)
         const next = [...cache, idempotencyKey];
-        if (next.length > capacity) next.splice(0, next.length - capacity);
+        const evicted = next.length > capacity ? next.splice(0, next.length - capacity) : [];
         try {
           await persist(next);
           cache = next;
+          if (evicted.length) evictedByReservation.set(idempotencyKey, evicted);
+          for (const key of evictedByReservation.keys()) if (!next.includes(key)) evictedByReservation.delete(key);
         } finally {
           // 无论落盘成没成都要清 in-flight:留着会让本进程后续的重投被判重复而
           // 静默跳过,而此时磁盘上并没有记录 —— 两头落空。
+          inFlight.delete(idempotencyKey);
+        }
+      });
+      tail = run.then(() => undefined, () => undefined);
+      return run;
+    },
+
+    async forgetUnstarted(idempotencyKey: string): Promise<void> {
+      const run = tail.then(async () => {
+        loaded ??= load();
+        cache ??= await loaded;
+        const retained = cache.filter(key => key !== idempotencyKey);
+        const restored = (evictedByReservation.get(idempotencyKey) ?? []).filter(key => !retained.includes(key));
+        const next = [...restored, ...retained].slice(-capacity);
+        try {
+          await persist(next);
+          cache = next;
+          evictedByReservation.delete(idempotencyKey);
+        } finally {
           inFlight.delete(idempotencyKey);
         }
       });
@@ -137,6 +161,7 @@ export function createFileDocMentionDedupeStore(params: {
 /** 进程内实现,供测试与显式关闭持久化的场景使用。 */
 export function createMemoryDocMentionDedupeStore(capacity = DEFAULT_CAPACITY): DocMentionDedupeStore {
   const keys: string[] = [];
+  const evictedByReservation = new Map<string, string[]>();
   const inFlight = new Set<string>();
   return {
     async claim(idempotencyKey: string): Promise<boolean> {
@@ -150,7 +175,16 @@ export function createMemoryDocMentionDedupeStore(capacity = DEFAULT_CAPACITY): 
       inFlight.delete(idempotencyKey);
       if (keys.includes(idempotencyKey)) return;
       keys.push(idempotencyKey);
+      if (keys.length > capacity) evictedByReservation.set(idempotencyKey, keys.splice(0, keys.length - capacity));
+      for (const key of evictedByReservation.keys()) if (!keys.includes(key)) evictedByReservation.delete(key);
+    },
+    async forgetUnstarted(idempotencyKey: string): Promise<void> {
+      const index = keys.indexOf(idempotencyKey);
+      if (index >= 0) keys.splice(index, 1);
+      keys.unshift(...(evictedByReservation.get(idempotencyKey) ?? []).filter(key => !keys.includes(key)));
       if (keys.length > capacity) keys.splice(0, keys.length - capacity);
+      evictedByReservation.delete(idempotencyKey);
+      inFlight.delete(idempotencyKey);
     },
     release(idempotencyKey: string): void { inFlight.delete(idempotencyKey); },
   };

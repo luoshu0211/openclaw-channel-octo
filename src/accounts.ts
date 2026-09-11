@@ -23,6 +23,7 @@ export type ResolvedOctoAccount = {
      * 字都没有」。
      */
     docsApiUrl: string;
+    docsCliPath?: string;
     wsUrl?: string;
     cdnUrl?: string;  // CDN base URL for media files (public-read, no auth)
     pollIntervalMs: number;
@@ -118,6 +119,7 @@ export function resolveOctoAccount(params: {
       botToken,
       apiUrl,
       docsApiUrl,
+      docsCliPath: accountConfig.docsCliPath ?? channel.docsCliPath,
       wsUrl,
       cdnUrl,
       pollIntervalMs,

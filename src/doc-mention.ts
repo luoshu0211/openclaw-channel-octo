@@ -1,3 +1,4 @@
+import { formatPptCommentTask } from "./ppt-comment.js";
 import { ChannelType, MessageType, type BotMessage } from "./types.js";
 import type { BotEvent } from "./card-action.js";
 
@@ -22,7 +23,7 @@ export interface DocCommentMention {
    * docId 查不到(那些接口不认 slug),没有这个字段就只能靠 404 猜,而 404 跟
    * 「文档真的不存在」没法区分。
    */
-  docKind?: "html";
+  docKind?: "html" | "ppt";
   commentId: string;
   /** 评论串根 id。server 已按 parent_id→comment_id 派生,插件不再自行推断。 */
   threadId: string;
@@ -81,10 +82,9 @@ export function parseDocCommentMention(event: BotEvent): DocCommentMention | nul
   };
   const parentId = stringValue(data.parent_id);
   if (parentId) mention.parentId = parentId;
-  // 只认 "html" 这一个已知值。将来 server 加了别的类型,旧插件会把它当普通文档 ——
-  // 那正是安全的一侧:走 docs-backend 会拿到明确的报错,而认下一个不会用的类型只会
-  // 让它去调一套自己还不支持的 API。
-  if (stringValue(data.doc_kind).toLowerCase() === "html") mention.docKind = "html";
+  const kind = stringValue(data.doc_kind).toLowerCase();
+  if (kind && kind !== "html" && kind !== "ppt") return null;
+  if (kind === "html" || kind === "ppt") mention.docKind = kind;
   const url = stringValue(data.url);
   if (url) mention.url = url;
   const spaceId = stringValue(data.space_id);
@@ -103,7 +103,7 @@ export function parseDocCommentMention(event: BotEvent): DocCommentMention | nul
  * GROUP.md,文档任务不应继承群聊规则。
  */
 export function docTaskSessionScope(mention: DocCommentMention): string {
-  return `doctask:${escapeScopeSegment(mention.docId)}:${escapeScopeSegment(mention.threadId)}`;
+  return `doctask:${mention.docKind === "ppt" ? "ppt:" : ""}${escapeScopeSegment(mention.docId)}:${escapeScopeSegment(mention.threadId)}`;
 }
 
 /**
@@ -129,7 +129,8 @@ function escapeScopeSegment(value: string): string {
  *   - `bot_setting_updated` 的缓存失效同样被推迟;
  *   - 这期间不再发起新的 fetch,所以**运行中新到的事件也一起等**。
  *
- * 上界是 dispatch 兜底超时,默认推导为 **660s** —— 最坏情况下卡片按钮十一分钟无响应。
+ * Dispatch 的默认预算是 **660s**；PPT 首轮与续步共用同一 deadline，不重置预算。
+ * 到期中止底层 Agent，另有有界取消宽限和回复发送时间。
  * 卡片动作是用户已有的功能,这条代价落在它身上,不只落在新功能上。
  *
  * 为什么现在仍然选串行:文档任务会改用户的文档、会往评论区发言,重放不幂等
@@ -155,8 +156,9 @@ export function docTaskQueueScope(mention: DocCommentMention): string {
  */
 export function formatDocMentionText(
   mention: DocCommentMention,
-  opts?: { docsBaseUrl?: string },
+  opts?: { docsBaseUrl?: string; docsCliPath?: string },
 ): string {
+  if (mention.docKind === "ppt") return formatPptCommentTask(mention, opts);
   // 载荷里的 url= 可能带 ?code= 这类分享读票;拼我们自己的地址时一概不带它。
   const docsBase = opts?.docsBaseUrl?.replace(/\/+$/, "");
   const wholeDocUrl = docsBase
@@ -316,7 +318,7 @@ function docTypeSkillHint(mention: DocCommentMention): string {
 export function synthesizeDocMentionMessage(
   mention: DocCommentMention,
   botUid: string,
-  opts?: { docsBaseUrl?: string },
+  opts?: { docsBaseUrl?: string; docsCliPath?: string },
 ): BotMessage {
   const channelId = mention.spaceId ? `s${mention.spaceId}_${mention.fromUid}` : mention.fromUid;
   return {

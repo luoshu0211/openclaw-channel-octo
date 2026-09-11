@@ -22,6 +22,7 @@ export interface OctoAccountConfig {
   enabled?: boolean;
   botToken?: string;
   apiUrl?: string;
+  docsCliPath?: string;
   docsApiUrl?: string;  // Base URL for the docs domain (/v1/bot/docs/**); unset = same origin as apiUrl
   wsUrl?: string;
   cdnUrl?: string;  // CDN base URL for media files (e.g. https://cdn.example.com/bucket)
@@ -52,6 +53,7 @@ export interface OctoConfig {
   enabled?: boolean;
   botToken?: string;
   apiUrl?: string;
+  docsCliPath?: string;
   docsApiUrl?: string;  // Top-level default for the docs-domain base URL; unset = same origin as apiUrl
   wsUrl?: string;
   cdnUrl?: string;  // CDN base URL for media files (e.g. https://cdn.example.com/bucket)
@@ -136,6 +138,9 @@ export const BOT_TASKS_DESCRIPTION =
 // We do not add a second knob because that turns one mismatch into two, and no
 // deployment we have needs the split. If one ever does, the fix is a separate
 // `htmlDocsApiUrl`, not a heuristic.
+export const DOCS_CLI_PATH_DESCRIPTION =
+  "Trusted local Octo CLI executable for PPT tasks; defaults to octo-cli.";
+
 export const DOCS_API_URL_DESCRIPTION =
   "Base URL for the docs domain used by document comment @Bot task replies — both docs-backend (/v1/bot/docs/**) and octo-doc (/docs-html/v1/**). When omitted, apiUrl is used, which is correct whenever one gateway origin fronts the IM server and both doc services. Setting it assumes those two doc services share ONE origin; serving them from two different origins is not supported. A wrong value makes every doc task reply 404 permanently — no retry, and the fallback notice is lost too, so the document is edited with no visible reply.";
 
@@ -174,6 +179,7 @@ export const OctoConfigJsonSchema = {
       botToken: { type: "string" },
       apiUrl: { type: "string" },
       docsApiUrl: { type: "string", description: DOCS_API_URL_DESCRIPTION },
+      docsCliPath: { type: "string", description: DOCS_CLI_PATH_DESCRIPTION },
       wsUrl: { type: "string" },
       cdnUrl: { type: "string" },
       pollIntervalMs: { type: "number", minimum: 500 },
@@ -199,6 +205,7 @@ export const OctoConfigJsonSchema = {
             botToken: { type: "string" },
             apiUrl: { type: "string" },
             docsApiUrl: { type: "string", description: DOCS_API_URL_DESCRIPTION },
+            docsCliPath: { type: "string", description: DOCS_CLI_PATH_DESCRIPTION },
             wsUrl: { type: "string" },
             cdnUrl: { type: "string" },
             pollIntervalMs: { type: "number", minimum: 500 },

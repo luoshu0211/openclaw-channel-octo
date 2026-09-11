@@ -172,6 +172,10 @@
                   "type": "number",
                   "minimum": 1000,
                   "description": "Per-inbound dispatch timeout in milliseconds (infrastructure backstop that releases the per-group queue when an upstream dispatch hangs). When unset, derived from agents.defaults.timeoutSeconds (default 600) as timeoutSeconds*1000 + 60000, so it always fires after the agent-run timeout. Set explicitly only when you need to decouple it from the agent timeout."
+                },
+                "docsCliPath": {
+                  "type": "string",
+                  "description": "Trusted local Octo CLI executable for PPT tasks; defaults to octo-cli."
                 }
               }
             }
@@ -204,6 +208,10 @@
                 }
               }
             }
+          },
+          "docsCliPath": {
+            "type": "string",
+            "description": "Trusted local Octo CLI executable for PPT tasks; defaults to octo-cli."
           }
         }
       }

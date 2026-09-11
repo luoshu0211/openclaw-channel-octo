@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import type { DocTaskDeadLetterStore } from "./doc-task-deadletter.js";
 import { normalizeAccountId } from "./account-id.js";
 import {
   ackBotEvent,
@@ -64,6 +65,8 @@ export function createFileEventCursorStore(params: {
 }
 
 export interface EventPollerOptions {
+  /** Existing task diagnostics; unsupported kinds are never dispatched or auto-replayed. */
+  docTaskDeadLetter?: DocTaskDeadLetterStore;
   apiUrl: string;
   botToken: string;
   cursorStore: EventCursorStore;
@@ -235,10 +238,11 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
       const controller = new AbortController();
       inFlight = controller;
       const timeoutSignal = AbortSignal.timeout(eventsPollTimeoutMs(waitSeconds));
+      const requestedCursor = cursor;
       const events = await fetchBotEvents({
         apiUrl: options.apiUrl,
         botToken: options.botToken,
-        sinceEventId: cursor,
+        sinceEventId: requestedCursor,
         limit,
         ...(waitSeconds > 0 ? { waitSeconds } : {}),
         // Combine both reasons to give up: the ordinary per-request timeout, and an explicit
@@ -256,13 +260,13 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
       let docMentions = 0;
       let botTasks = 0;
       const ordered = events
-        .filter((event) => Number.isSafeInteger(event.event_id) && event.event_id > cursor)
+        .filter((event) => Number.isSafeInteger(event.event_id) && event.event_id > requestedCursor)
         .sort((a, b) => a.event_id - b.event_id);
-      // A retryable Bot Task leaves a cursor gap. Later events may still be
-      // handled and ACKed, but the durable/in-memory cursor must not advance
-      // past that gap or the failed task would be skipped forever.
+      // Only retryable Bot Tasks retain a bounded retry gap.
       let cursorBlocked = false;
       for (const event of ordered) {
+        // Finish the current receipt on stop, but never start another task.
+        if (stopped) return;
         // 已识别的事件才 ack。未识别的只推进游标(本消费者不再重复拉取),
         // 留在服务端直至过期 —— 不 ack 自己没处理的事件。
         let recognized = false;
@@ -291,6 +295,38 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
               options.log?.error?.(
                 `octo: doc mention handler threw for event ${event.event_id}: ${error instanceof Error ? error.message : String(error)}`,
               );
+            }
+            // Only PPT has a durable pre-handoff reservation that makes replay
+            // safe. Legacy/HTML must finish their cursor + ACK even on shutdown.
+            if (stopped && mention.docKind === "ppt") return;
+          } else if (event.event_type === "doc_comment_mention") {
+            const rawKind =
+              event.event_data && typeof event.event_data === "object"
+                ? event.event_data.doc_kind
+                : undefined;
+            if (
+              typeof rawKind === "string" &&
+              rawKind.trim() &&
+              !["html", "ppt"].includes(rawKind.trim().toLowerCase())
+            ) {
+              // An unknown protocol cannot safely select a comment API. Record it
+              // for operator recovery, then advance without ACK or agent execution.
+              // Retaining an unbounded gap would replay later completed tasks once
+              // their bounded dedupe entries have been evicted.
+              const data = event.event_data ?? {};
+              const field = (value: unknown) => typeof value === "string" ? value.slice(0, 256) : "";
+              const kind = rawKind.slice(0, 128);
+              options.log?.error?.(`octo: unsupported doc_kind for event ${event.event_id}: ${JSON.stringify(kind)}; recorded for operator recovery without dispatch or ACK`);
+              try {
+                await options.docTaskDeadLetter?.record({
+                  idempotencyKey: field(data.idempotency_key) || `unsupported:${event.event_id}`,
+                  docId: field(data.doc_id), threadId: field(data.thread_id) || field(data.comment_id),
+                  at: new Date().toISOString(), reason: "unsupported_doc_kind",
+                  detail: `event_id=${event.event_id} doc_kind=${JSON.stringify(kind)}`,
+                });
+              } catch {
+                options.log?.error?.(`octo: unsupported doc event ${event.event_id} could not be recorded; cursor still advances`);
+              }
             }
           }
         }
@@ -321,7 +357,7 @@ export function startEventPoller(options: EventPollerOptions): EventPoller {
               await options.onBotTask(parsed.task);
             } catch (error) {
               retryBotTask = true;
-              cursorBlocked = true;
+                cursorBlocked = true;
               if (error instanceof RetryableBotTaskError) {
                 botTaskRetryAttempt = Math.max(botTaskRetryAttempt, error.attemptCount);
               }

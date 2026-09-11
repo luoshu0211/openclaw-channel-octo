@@ -1,8 +1,9 @@
+import { isPptPlanningReply, isValidPptThreadId } from "./ppt-comment.js";
 import { docTaskQueueScope, docTaskSessionScope, synthesizeDocMentionMessage, type DocCommentMention } from "./doc-mention.js";
 import type { DocMentionDedupeStore } from "./doc-mention-dedupe.js";
 import type { DocTaskDeadLetterStore } from "./doc-task-deadletter.js";
 import type { BotMessage } from "./types.js";
-import { isPermanentDocCommentFailure } from "./api-fetch.js";
+import { httpStatusFromApiFetchError, isPermanentDocCommentFailure } from "./api-fetch.js";
 import type { DocReplyIntent } from "./api-fetch.js";
 
 /**
@@ -66,8 +67,14 @@ export type DocMentionDispatch = (
       reportTurn: (report: DocTaskTurnReport) => void;
       /** Bot Task 超时后中止底层 Agent，防止已失去监管的回合继续写业务数据。 */
       abortOnTimeout?: boolean;
+      /** Shared absolute deadline across PPT attempts and the single continuation. */
+      deadlineAt?: number;
+      /** Account shutdown must cancel an already-running PPT agent. */
+      signal?: AbortSignal;
       /** 立即在将回合交给 Agent runtime 前调用。 */
       onAgentTurnStarted?: () => void | Promise<void>;
+      /** Roll back the reservation only when runtime was never called. */
+      onAgentTurnNotStarted?: () => void | Promise<void>;
     };
   },
 ) => Promise<"completed" | "dropped">;
@@ -80,6 +87,11 @@ export interface DocMentionHandlerDeps {
    * 会在拆分部署上打错主机,并把 bot token 发到入站文本决定的地址上。
    */
   docsBaseUrl?: string;
+  docsCliPath?: string;
+  readPptRevision?: (mention: DocCommentMention, signal?: AbortSignal) => Promise<number>;
+  /** Resolved account dispatch budget, shared by both PPT rounds. */
+  dispatchTimeoutMs?: number | (() => number);
+  signal?: AbortSignal;
   dedupe: DocMentionDedupeStore;
   dispatch: DocMentionDispatch;
   postComment: (
@@ -154,11 +166,62 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
       return;
     }
 
+    const isPpt = mention.docKind === "ppt";
+    if (isPpt && !isValidPptThreadId(mention.threadId)) {
+      // A permanent wire error must be terminal BEFORE any read or agent edit.
+      // There is no valid thread to notify; retain an operator-visible record.
+      deps.log?.error?.(`octo: invalid PPT reply target doc=${JSON.stringify(mention.docId)} thread=${JSON.stringify(mention.threadId)}; agent skipped`);
+      await deps.deadLetter?.record({
+        idempotencyKey: mention.idempotencyKey,
+        docId: mention.docId,
+        threadId: mention.threadId,
+        at: new Date().toISOString(),
+        reason: "invalid_ppt_reply_target",
+        detail: "PPT thread ID is not a canonical positive safe integer; agent was not started",
+      });
+      try {
+        await deps.dedupe.complete(mention.idempotencyKey);
+      } catch {
+        deps.dedupe.release(mention.idempotencyKey);
+        deps.log?.error?.("octo: could not persist rejected PPT reply target");
+      }
+      return;
+    }
+    let configuredBudget: number | undefined;
+    try {
+      if (isPpt) configuredBudget = typeof deps.dispatchTimeoutMs === "function"
+        ? deps.dispatchTimeoutMs() : deps.dispatchTimeoutMs;
+    } catch {
+      // A transient config read must not silently ACK and discard the task.
+      // Keep account cancellation and the same finite default used below.
+      deps.log?.error?.("octo: could not resolve PPT task budget; using default budget");
+    }
+    const deadlineAt = isPpt
+      ? Date.now() + (typeof configuredBudget === "number" && Number.isFinite(configuredBudget) && configuredBudget > 0 ? configuredBudget : 660_000)
+      : undefined;
+    const readRevision = async (): Promise<number | undefined> => {
+      try {
+        const remaining = deadlineAt === undefined ? 10_000 : deadlineAt - Date.now();
+        if (remaining <= 0 || deps.signal?.aborted) return undefined;
+        const timeout = AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(remaining, 10_000))));
+        const signal = deps.signal ? AbortSignal.any([deps.signal, timeout]) : timeout;
+        return await deps.readPptRevision?.(mention, signal);
+      } catch (error) {
+        // Log identifiers and status only; upstream bodies can contain secrets.
+        deps.log?.error?.(
+          `octo: PPT revision read failed doc=${JSON.stringify(mention.docId)} thread=${JSON.stringify(mention.threadId)} status=${httpStatusFromApiFetchError(error) ?? "unknown"}; continuation disabled`,
+        );
+        return undefined;
+      }
+    };
+    const initialRevision = mention.docKind === "ppt" ? await readRevision() : undefined;
+    let lastFinal: string | undefined;
     const postWithRetry = async (
       text: string,
       signal?: AbortSignal,
       intent?: DocReplyIntent,
     ): Promise<void> => {
+      if (isPpt && deps.signal) signal = signal ? AbortSignal.any([signal, deps.signal]) : deps.signal;
       let lastErr: unknown;
       for (let attempt = 1; attempt <= POST_ATTEMPTS; attempt += 1) {
         // 已 abort 就别再退避重试:调用方(超时兜底)给的本来就是短超时 signal,
@@ -169,6 +232,7 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
         }
         try {
           await deps.postComment(mention, text, signal, intent);
+          if (intent === "final") lastFinal = text;
           return;
         } catch (err) {
           lastErr = err;
@@ -177,7 +241,10 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
           );
           // 确定性失败(信封拒绝、4xx)重试不会变好 —— 只会在轮询器的串行循环里
           // 白烧三次 POST 和 600ms,而后面的兜底通知还要再烧一遍同样的三次。
-          if (isPermanentDocCommentFailure(err)) break;
+          // `postJson` already owns the bounded Retry-After-aware 429 loop. Starting the
+          // handler's 200/400ms retry loop after it gives up would immediately violate the
+          // last Retry-After and multiply one reply into as many as nine requests.
+          if (isPermanentDocCommentFailure(err) || httpStatusFromApiFetchError(err) === 429) break;
           // signal 在这次 POST 期间被 abort 了:再退避 200/400ms 纯属在串行的轮询
           // 循环里空耗 —— 循环顶部那道检查要到下一轮才生效,已经晚了。
           if (signal?.aborted) break;
@@ -191,18 +258,38 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
 
     let reported: DocTaskTurnReport | undefined;
     let outcome: "completed" | "dropped" = "dropped";
+    let anyFinalDelivered = false;
+    let agentStarted = false;
     try {
-      outcome = await deps.dispatch(
-        synthesizeDocMentionMessage(mention, deps.botUid, { docsBaseUrl: deps.docsBaseUrl }),
-        undefined,
-        {
+      const dispatch = async (message: BotMessage) => {
+        if (isPpt && (deps.signal?.aborted || Date.now() >= deadlineAt!)) {
+          throw new Error("PPT task stopped or its shared dispatch budget expired");
+        }
+        const previouslyStarted = agentStarted;
+        return deps.dispatch(message, undefined, {
           queueScope: docTaskQueueScope(mention),
           docTask: {
             docId: mention.docId,
             threadId: mention.threadId,
             sessionScope: docTaskSessionScope(mention),
             postComment: postWithRetry,
+            ...(isPpt ? {
+              deadlineAt, abortOnTimeout: true, signal: deps.signal,
+              onAgentTurnStarted: async () => {
+                // Persist before runtime handoff. A cancelled or crashed editing
+                // turn may already have written; replay must not start it again.
+                await deps.dedupe.complete(mention.idempotencyKey);
+                agentStarted = true;
+              },
+              onAgentTurnNotStarted: async () => {
+                if (!previouslyStarted && deps.dedupe.forgetUnstarted) {
+                  await deps.dedupe.forgetUnstarted(mention.idempotencyKey);
+                  agentStarted = false;
+                }
+              },
+            } : {}),
             reportTurn: (value) => {
+              anyFinalDelivered ||= value.finalDelivered;
               reported = reported
                 ? {
                     finalDelivered: reported.finalDelivered || value.finalDelivered,
@@ -213,8 +300,31 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
                 : value;
             },
           },
-        },
-      );
+        });
+      };
+      const message = () =>
+        synthesizeDocMentionMessage(mention, deps.botUid, {
+          docsBaseUrl: deps.docsBaseUrl,
+          docsCliPath: deps.docsCliPath,
+        });
+      outcome = await dispatch(message());
+      if (
+        mention.docKind === "ppt" &&
+        Number.isSafeInteger(initialRevision) &&
+        reported?.finalDelivered &&
+        isPptPlanningReply(lastFinal) &&
+        await readRevision() === initialRevision &&
+        !deps.signal?.aborted && Date.now() < deadlineAt!
+      ) {
+        const next = message();
+        next.message_id += ":execute-once";
+        next.payload.content +=
+          "\n执行续步：上一轮仅回复了计划，服务端版本号尚未变化。请现在完成原请求：用工具读取权威锚点和最新 PPT，执行所需修改、提交并读回。不要再回复计划。若原请求只需解释、已经满足、被取消、缺少权限或目标不明确，则不修改并说明。此续步最多一次，绝不重复已完成的写入。";
+        // A plan delivered in round one is not evidence that round two completed.
+        reported = undefined;
+        lastFinal = undefined;
+        outcome = await dispatch(next);
+      }
     } catch (err) {
       deps.log?.error?.(
         `octo: doc task dispatch failed doc=${mention.docId} thread=${mention.threadId}: ${String(err)}`,
@@ -236,21 +346,25 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
     // 进了评论区」本身,不需要再用 `&& !lost` 去补偿。那个补偿是回合全局的:一次
     // 进度评论的瞬时 5xx 会否决掉一个确实落地的最终答复,于是在正确答复下面贴出
     // 「没有给出答复」并允许重放。`lost` 现在只作观测字段。
-    /** 活儿落地了:最终答复确实进了评论区。 */
+    // A phrasing heuristic only gates the optional continuation. It cannot
+    // contradict a delivered answer or prove whether an edit was committed.
+    const planningSuspected = mention.docKind === "ppt" && isPptPlanningReply(lastFinal);
     const workLanded = report.finalDelivered;
     /** 用户在干等:既没拿到答复,也没收到任何失败提示。 */
     const userLeftHanging = !workLanded && !report.noticed;
 
     deps.log?.info?.(
       `octo: doc task doc=${mention.docId} thread=${mention.threadId} workLanded=${workLanded} ` +
-        `final=${report.finalDelivered} delivered=${report.delivered} lost=${report.lost} noticed=${report.noticed} dispatch=${outcome}`,
+        `planningSuspected=${planningSuspected} final=${report.finalDelivered} delivered=${report.delivered} lost=${report.lost} noticed=${report.noticed} dispatch=${outcome}`,
     );
 
     if (userLeftHanging) {
       let noticeErr: unknown;
       try {
         await postWithRetry(
-          NOTHING_DELIVERED_NOTICE,
+          mention.docKind === "ppt" && anyFinalDelivered
+            ? "本次执行续步未能送达最终答复，无法确认修改结果。请先检查当前 PPT；系统不会自动重复执行。"
+            : NOTHING_DELIVERED_NOTICE,
           AbortSignal.timeout(DOC_TASK_NOTICE_TIMEOUT_MS),
           // ★ 必须显式 "notice"。缺省会在 postHtmlDocReply 回落成 applied ——
           // 那正好把这条「本次没有给出答复」渲染成「已完成」,是本 PR 要消灭的反面。
@@ -274,13 +388,15 @@ export function createDocMentionHandler(deps: DocMentionHandlerDeps) {
           docId: mention.docId,
           threadId: mention.threadId,
           at: new Date().toISOString(),
-          reason: "undelivered_after_ack",
+          reason: deps.signal?.aborted ? "account_stopped_before_notice" : "undelivered_after_ack",
           detail: String(noticeErr),
         });
       }
     }
 
-    if (workLanded) {
+    // A delivered plan followed by uncertain execution must not let replay of
+    // the same event run a non-idempotent edit again. A new mention has a new key.
+    if (workLanded || (isPpt && (agentStarted || anyFinalDelivered))) {
       try {
         await deps.dedupe.complete(mention.idempotencyKey);
       } catch (err) {

@@ -155,11 +155,17 @@ When replying, always use the `channel_id` and `channel_type` from the received 
 
 ### Sending Cards (Interactive Card, payload.type=17)
 
+`payload.type=7` is a **personal contact card (个人名片卡)**: `payload.uid` identifies the person and `payload.name` is their display name. It is not a generic card container and cannot define custom titles, fields, or buttons.
+
+For custom structured content, use `payload.type=17` (Interactive Card): `profile:"octo/v1"` for display cards with local/link actions and no callback, or `profile:"octo/v2"` for inputs and `Action.Submit` callbacks. Both use `card_version:"1.5"` and an Adaptive Card with `card.version:"1.5"`; the profile, not the version string or the name "Interactive Card", selects callback support.
+
 Card-specific guidance lives in the progressive `$octo-card-message` skill. Use it before any card work; it selects plain text, `octo_send_display_card` (octo/v1, no callback), or `octo_send_card` (octo/v2 `Action.Submit` with callback) and loads only the reference needed for that path.
 
 In particular, use `$octo-card-message` before asking for a confirmation, approval/rejection, menu choice, or short form. The P2 tool polls `card_action` automatically and resumes the originating conversation, but a verified click identifies the channel member only; it never grants business authority by itself.
 
 The old [card reference](references/interactive-card-messages.md) is retained only as a compatibility pointer. Do not load the former mixed display/interactive/raw protocol guide for normal tool calls.
+
+For a hand-written Bot API client, read [Raw Card API](../octo-card-message/references/raw-api.md) for the authenticated `GET /v1/bot/card/profile` probe and complete display/submit payload examples. Do not probe support by sending a card and interpreting a 400 response.
 
 ## Real-time Features
 
@@ -386,8 +392,9 @@ Verify identity through the system (owner_uid), not conversation.
 - 4 = Voice (payload.url, payload.duration)
 - 5 = Video (payload.url, payload.width, payload.height, payload.duration)
 - 6 = Location (payload.latitude, payload.longitude)
-- 7 = Card (payload.uid, payload.name)
+- 7 = Personal contact card / 个人名片卡 (payload.uid, payload.name); not a customizable structured card
 - 8 = File (payload.url, payload.name, payload.size)
+- 17 = Structured / Interactive Card (payload.card, payload.profile, payload.card_version); see [Sending Cards](#sending-cards-interactive-card-payloadtype17)
 
 ### All API Endpoints
 
@@ -395,6 +402,7 @@ Verify identity through the system (owner_uid), not conversation.
 |----------|-------------|
 | POST /v1/bot/register | Register bot, get credentials |
 | POST /v1/bot/sendMessage | Send a message |
+| GET /v1/bot/card/profile | Discover effective per-Bot card policy, profiles, version, element/input/action capabilities, and limits |
 | POST /v1/bot/typing | Show typing indicator |
 | POST /v1/bot/heartbeat | Keep online status |
 | POST /v1/bot/readReceipt | Send read receipt |
